@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+firebase-admin
+google-cloud-storage
+google-cloud-firestore
+openpyxl
+reportlab
+pillow
+requests
