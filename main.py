@@ -20,7 +20,6 @@ import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
 
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -67,7 +66,6 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"]
 )
-app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
 # ───────────────────────── Firestore / Storage init ─────────────────────────
 def _get_sa_info() -> dict:
@@ -528,3 +526,4 @@ def download_file(kind: str, filename: str):
     return FileResponse(path=str(file_path), media_type=media, filename=file_path.name)
 
 # (en Render: START ➜ uvicorn app:app --host 0.0.0.0 --port $PORT)
+
