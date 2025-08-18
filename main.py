@@ -473,7 +473,7 @@ def generar_rendicion_bundle(
         startDay = str(int(startDC.strftime("%d")))
         endDay = str(int((endDC or startDC).strftime("%d")))
         mes = mes_es(startDC); yy = startDC.strftime("%y")
-        pdf_name = f"{meta.get('nameCampana', '—')} Rendición Fotos {startDay}-{endDay} {mes} {yy}.pdf"
+        pdf_name = f"{meta.get('nameCampana', '—')} Rendición {startDay}-{endDay} {mes} {yy}.pdf"
     else:
         pdf_name = "Rendicion_Fotos.pdf"
 
@@ -526,4 +526,5 @@ def download_file(kind: str, filename: str):
     return FileResponse(path=str(file_path), media_type=media, filename=file_path.name)
 
 # (en Render: START ➜ uvicorn app:app --host 0.0.0.0 --port $PORT)
+
 
