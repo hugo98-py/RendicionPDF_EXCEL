@@ -8,7 +8,7 @@ Created on Sun Aug 17 19:40:11 2025
 # app.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import os, re, json, base64, traceback
+import os, re, json, base64, traceback, unicodedata
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, unquote
@@ -64,6 +64,9 @@ TZ_CHILE = ZoneInfo("America/Santiago")
 LOGO_PATH = Path(os.getenv("RENDIDOR_LOGO_PATH", Path(__file__).parent / "logo_ams.png")).resolve()
 
 # Paleta AMS (tomada del logo)
+# Campos de "registros" donde puede venir el tipo de comprobante (boleta / factura)
+TIPO_COMPROBANTE_FIELDS = ("tipoComprobante", "tipo", "comprobante", "tipoDocumento", "tipoDoc", "tipoBoleta")
+
 AMS_GRIS, AMS_VERDE, AMS_AMARILLO, AMS_AZUL = "#58595B", "#7AB573", "#F2DA00", "#84BCE4"
 
 MESES_ES = [
@@ -216,6 +219,20 @@ def fetch_campana(campana_id: Optional[str], collection_name: str = CAMPANA_COLL
     print(f"[rendidor] campaña no encontrada: {CAMPANA_ID_FIELD}={campana_id}")
     return {}
 
+def _slug_categoria(cat: str) -> str:
+    """'Alimentación' -> 'Alimentacion' (para armar monto<Categoria>Total)."""
+    s = unicodedata.normalize("NFKD", str(cat)).encode("ascii", "ignore").decode()
+    return "".join(p[:1].upper() + p[1:] for p in re.split(r"[^A-Za-z0-9]+", s) if p)
+
+def montos_por_categoria(camp: dict) -> Dict[str, float]:
+    """Lee los campos monto<Categoria>Total de la campaña -> {'alimentacion': 50000, ...}."""
+    out: Dict[str, float] = {}
+    for k, v in (camp or {}).items():
+        m = re.fullmatch(r"monto(.+)Total", str(k))
+        if m and v is not None:
+            out[m.group(1).lower()] = _clean_monto(v)
+    return out
+
 def resumen_por_categoria(registros: List[dict]) -> List[Tuple[str, int, float]]:
     """[(categoria, n_boletas, monto)] solo de las categorías con registros."""
     acc: Dict[str, List[float]] = {}
@@ -248,9 +265,11 @@ def fetch_registros(
         idb = data.get("idBoleta") or data.get("Boleta") or ""
         mon = _clean_monto(data.get("monto") or data.get("Gasto"))
         fotos = _extract_urls_from_fotos(data.get(fotos_field))
+        tipo = next((str(data[k]) for k in TIPO_COMPROBANTE_FIELDS if data.get(k)), "")
         registros.append({
             "doc_id": doc.id, "date": d_dt, "categoria": cat,
-            "idBoleta": idb, "Monto": mon, "fotos": fotos
+            "idBoleta": idb, "Monto": mon, "fotos": fotos,
+            "esFactura": "factura" in tipo.lower(),
         })
         if nameCampana is None: nameCampana = data.get("nameCampana")
         if namePersona is None: namePersona = data.get("namePersona")
@@ -283,7 +302,7 @@ def _find_headers(ws: Worksheet, names=("Fecha","Detalle","Boleta","Gasto"), sea
                 if v in wanted and v not in headers:
                     headers[v] = c
         if len(headers) == len(names): break
-    defaults = {"Fecha":1, "Detalle":2, "Boleta":3, "Gasto":4}
+    defaults = {"Fecha":1, "Detalle":4, "Factura":5, "Boleta":6, "Gasto":7}
     for k in defaults: headers.setdefault(k, defaults[k])
     return headers
 
@@ -325,7 +344,7 @@ def write_excel_from_template(
     wb = load_workbook(template_path, data_only=False)
     ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb.active
 
-    cols = _find_headers(ws, names=("Fecha", "Detalle", "Boleta", "Gasto"))
+    cols = _find_headers(ws, names=("Fecha", "Detalle", "Factura", "Boleta", "Gasto"))
 
     nameCampana = meta.get("nameCampana") or DEFAULT_NAME_CAMPANA
     namePersona = meta.get("namePersona") or DEFAULT_NAME_PERSONA
@@ -342,7 +361,7 @@ def write_excel_from_template(
     if endDC:   ws["E5"] = _to_ddmmyyyy(endDC)
     ws["E7"] = _clean_monto(montoTotal)
 
-    used_cols = [cols["Fecha"], cols["Detalle"], cols["Boleta"], cols["Gasto"]]
+    used_cols = [cols["Fecha"], cols["Detalle"], cols["Factura"], cols["Boleta"], cols["Gasto"]]
     n = len(registros)
 
     if n >= 2:
@@ -364,7 +383,9 @@ def write_excel_from_template(
         dt = reg["date"]
         ws.cell(row=row, column=cols["Fecha"]).value = _to_ddmmyyyy(dt) if dt else ""
         ws.cell(row=row, column=cols["Detalle"]).value = reg.get("categoria", "")
-        ws.cell(row=row, column=cols["Boleta"]).value = reg.get("idBoleta", "")
+        # El N° de documento va en "Factura" (E) o en "Boleta" (F) según el tipo de comprobante
+        col_doc = cols["Factura"] if reg.get("esFactura") else cols["Boleta"]
+        ws.cell(row=row, column=col_doc).value = reg.get("idBoleta", "")
         ws.cell(row=row, column=cols["Gasto"]).value = float(reg.get("Monto") or 0.0)
 
     # Bordes A..G
@@ -538,15 +559,19 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
         ("Responsable de rendición", meta.get("responsable") or "—"),
         ("Fecha de rendición",       _to_ddmmyyyy(fechaRend)),
     ]
-    if startDC:
-        campos.append(("Período de terreno", f"{_to_ddmmyyyy(startDC)} al {_to_ddmmyyyy(endDC or startDC)}"))
+    periodo = str(meta.get("periodoTexto") or "").strip()
+    if not periodo and startDC:
+        periodo = f"{_to_ddmmyyyy(startDC)} al {_to_ddmmyyyy(endDC or startDC)}"
+    if periodo:
+        campos.append(("Período de terreno", periodo))
 
     y = ph - 170
     for i, (lab, val) in enumerate(campos):
         c.setFillColor(gris); c.setFont("Helvetica", 9)
         c.drawString(mx, y, lab.upper())
-        c.setFillColor(azul if i == 0 else HexColor("#111111"))
-        fsz = 20 if i == 0 else 13
+        destacado = i <= 1      # código del proyecto y campaña
+        c.setFillColor(azul if destacado else HexColor("#111111"))
+        fsz = 20 if destacado else 13
         c.setFont("Helvetica-Bold", fsz)
         c.drawString(mx, y - fsz - 2, _fit_text(c, val, "Helvetica-Bold", fsz, pw - 2 * mx))
         y -= fsz + 28
@@ -554,6 +579,7 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
     # Tarjetas de resumen
     resumen = resumen_por_categoria(registros)
     gastado = sum(m for _, _, m in resumen)
+    asignados: Dict[str, float] = meta.get("montosCategoria") or {}
     asignado = _clean_monto(meta.get("montoTotal"))
     saldo = asignado - gastado
     tarjetas = [("MONTO TOTAL", asignado, azul, celeste), ("TOTAL GASTADO", gastado, azul, amarillo),
@@ -594,6 +620,8 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
         c.drawString(x0 + 10, y - 15, _fit_text(c, cat, "Helvetica", 10, xb - x0 - 80))
         c.drawRightString(xb, y - 15, str(nb))
         c.drawRightString(xg, y - 15, _fmt_clp(monto))
+        asig = asignados.get(_slug_categoria(cat).lower())
+        c.drawRightString(x1 - 10, y - 15, _fmt_clp(asig) if asig is not None else "—")
         y -= rh
 
     # Filas de totales
@@ -679,6 +707,8 @@ def generar_rendicion_bundle(
     meta["nameCampana"]    = camp.get("name") or meta["nameCampana"]
     meta["responsable"]    = camp.get("responsable") or meta["namePersona"]
     meta["fechaRendicion"] = datetime.now(TZ_CHILE)
+    meta["periodoTexto"]   = camp.get("dateTimeTextFormat") or ""
+    meta["montosCategoria"] = montos_por_categoria(camp)
     if camp.get("montoTotal") is not None:
         meta["montoTotal"] = _clean_monto(camp.get("montoTotal"))
 
