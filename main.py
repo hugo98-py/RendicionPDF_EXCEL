@@ -233,6 +233,25 @@ def montos_por_categoria(camp: dict) -> Dict[str, float]:
             out[m.group(1).lower()] = _clean_monto(v)
     return out
 
+def saldos_por_categoria(camp: dict) -> Dict[str, float]:
+    """Lee los campos saldoDisponible<Categoria> -> {'alimentacion': 30000, ..., 'total': 120000}."""
+    out: Dict[str, float] = {}
+    for k, v in (camp or {}).items():
+        m = re.fullmatch(r"saldoDisponible(.+)", str(k))
+        if m and v is not None:
+            out[m.group(1).lower()] = _clean_monto(v)
+    return out
+
+def _buscar_categoria(d: Dict[str, float], cat: str) -> Optional[float]:
+    """Busca la categoría tolerando singular/plural (Peaje ↔ saldoDisponiblePeajes)."""
+    key = _slug_categoria(cat).lower()
+    if key in d:
+        return d[key]
+    for k, v in d.items():
+        if k != "total" and k.rstrip("s") == key.rstrip("s"):
+            return v
+    return None
+
 def resumen_por_categoria(registros: List[dict]) -> List[Tuple[str, int, float]]:
     """[(categoria, n_boletas, monto)] solo de las categorías con registros."""
     acc: Dict[str, List[float]] = {}
@@ -580,8 +599,9 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
     resumen = resumen_por_categoria(registros)
     gastado = sum(m for _, _, m in resumen)
     asignados: Dict[str, float] = meta.get("montosCategoria") or {}
+    saldos: Dict[str, float] = meta.get("saldosCategoria") or {}
     asignado = _clean_monto(meta.get("montoTotal"))
-    saldo = asignado - gastado
+    saldo = saldos["total"] if "total" in saldos else asignado - gastado
     tarjetas = [("MONTO TOTAL", asignado, azul, celeste), ("TOTAL GASTADO", gastado, azul, amarillo),
                 ("SALDO", saldo, rojo if saldo < 0 else azul, rojo if saldo < 0 else verde)]
     gap = 12; cw = (pw - 2 * mx - 2 * gap) / 3; chh = 58
@@ -596,14 +616,15 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
 
     # Tabla por categoría
     x0, x1 = mx, pw - mx
-    xb, xg = x1 - 230, x1 - 120     # columnas: boletas, monto gastado (monto total va al borde)
+    xb, xg, xt = x1 - 290, x1 - 195, x1 - 100     # columnas: boletas, gastado, total (saldo va al borde)
     rh = 22
     c.setFillColor(azul); c.rect(x0, y - rh, x1 - x0, rh, stroke=0, fill=1)
     c.setFillColor(white); c.setFont("Helvetica-Bold", 10)
     c.drawString(x0 + 10, y - 15, "Categoría")
     c.drawRightString(xb, y - 15, "N° boletas")
     c.drawRightString(xg, y - 15, "Monto gastado")
-    c.drawRightString(x1 - 10, y - 15, "Monto total")
+    c.drawRightString(xt, y - 15, "Monto total")
+    c.drawRightString(x1 - 10, y - 15, "Saldo")
     y -= rh
 
     if not resumen:
@@ -620,8 +641,14 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
         c.drawString(x0 + 10, y - 15, _fit_text(c, cat, "Helvetica", 10, xb - x0 - 80))
         c.drawRightString(xb, y - 15, str(nb))
         c.drawRightString(xg, y - 15, _fmt_clp(monto))
-        asig = asignados.get(_slug_categoria(cat).lower())
-        c.drawRightString(x1 - 10, y - 15, _fmt_clp(asig) if asig is not None else "—")
+        asig = _buscar_categoria(asignados, cat)
+        c.drawRightString(xt, y - 15, _fmt_clp(asig) if asig is not None else "—")
+        sal = _buscar_categoria(saldos, cat)
+        if sal is None and asig is not None:
+            sal = asig - monto
+        if sal is not None and sal < 0:
+            c.setFillColor(rojo)
+        c.drawRightString(x1 - 10, y - 15, _fmt_clp(sal) if sal is not None else "—")
         y -= rh
 
     # Filas de totales
@@ -630,7 +657,10 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
     c.drawString(x0 + 10, y - 15, "Total")
     c.drawRightString(xb, y - 15, str(len(registros)))
     c.drawRightString(xg, y - 15, _fmt_clp(gastado))
-    c.drawRightString(x1 - 10, y - 15, _fmt_clp(asignado))
+    c.drawRightString(xt, y - 15, _fmt_clp(asignado))
+    if saldo < 0:
+        c.setFillColor(rojo)
+    c.drawRightString(x1 - 10, y - 15, _fmt_clp(saldo))
     y -= rh
     c.setStrokeColor(linea); c.setLineWidth(0.6); c.line(x0, y, x1, y)
 
@@ -709,6 +739,7 @@ def generar_rendicion_bundle(
     meta["fechaRendicion"] = datetime.now(TZ_CHILE)
     meta["periodoTexto"]   = camp.get("dateTimeTextFormat") or ""
     meta["montosCategoria"] = montos_por_categoria(camp)
+    meta["saldosCategoria"] = saldos_por_categoria(camp)
     if camp.get("montoTotal") is not None:
         meta["montoTotal"] = _clean_monto(camp.get("montoTotal"))
 
