@@ -15,6 +15,7 @@ from urllib.parse import urlparse, unquote
 from typing import Any, List, Tuple, Optional, Union, Dict
 from datetime import datetime
 from copy import copy
+from zoneinfo import ZoneInfo
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
@@ -33,6 +34,7 @@ from openpyxl.styles import Border, Side
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
+from reportlab.lib.colors import HexColor, white
 from PIL import Image as PILImage
 
 # ───────────────────────────────── CONFIG ──────────────────────────────────
@@ -53,13 +55,24 @@ def default_fotos_dir() -> Path:
 DEFAULT_NAME_CAMPANA = "—"
 DEFAULT_NAME_PERSONA = "—"
 
+# Colección de campañas y campo interno que guarda el ID que llega a la API
+CAMPANA_COLLECTION = os.getenv("RENDIDOR_CAMPANA_COLLECTION", "campana")
+CAMPANA_ID_FIELD   = os.getenv("RENDIDOR_CAMPANA_ID_FIELD", "campanaID")
+TZ_CHILE = ZoneInfo("America/Santiago")
+
+# Logo para la portada del PDF, en el root del repo (override con RENDIDOR_LOGO_PATH)
+LOGO_PATH = Path(os.getenv("RENDIDOR_LOGO_PATH", Path(__file__).parent / "logo_ams.png")).resolve()
+
+# Paleta AMS (tomada del logo)
+AMS_GRIS, AMS_VERDE, AMS_AMARILLO, AMS_AZUL = "#58595B", "#7AB573", "#F2DA00", "#84BCE4"
+
 MESES_ES = [
     "enero","febrero","marzo","abril","mayo","junio",
     "julio","agosto","septiembre","octubre","noviembre","diciembre"
 ]
 
 # ─────────────────────────────── FastAPI init ───────────────────────────────
-app = FastAPI(title="Rendidor API", version="1.0.0")
+app = FastAPI(title="Rendidor API", version="1.1.0")
 
 # Middleware
 app.add_middleware(
@@ -183,6 +196,36 @@ def _clean_monto(x: Any) -> float:
 def mes_es(dt: datetime) -> str:
     return MESES_ES[dt.month - 1]
 
+def _fmt_clp(x: Any) -> str:
+    v = int(round(_clean_monto(x)))
+    s = f"{abs(v):,}".replace(",", ".")
+    return f"-$ {s}" if v < 0 else f"$ {s}"
+
+def fetch_campana(campana_id: Optional[str], collection_name: str = CAMPANA_COLLECTION) -> dict:
+    """Lee el documento de la campaña. Busca por el campo interno CAMPANA_ID_FIELD
+    y, si no encuentra nada, prueba con campana_id como ID del documento."""
+    if not campana_id:
+        return {}
+    fs, _ = init_clients()
+    col = fs.collection(collection_name)
+    for snap in col.where(CAMPANA_ID_FIELD, "==", campana_id).limit(1).stream():
+        return snap.to_dict() or {}
+    snap = col.document(campana_id).get()
+    if snap.exists:
+        return snap.to_dict() or {}
+    print(f"[rendidor] campaña no encontrada: {CAMPANA_ID_FIELD}={campana_id}")
+    return {}
+
+def resumen_por_categoria(registros: List[dict]) -> List[Tuple[str, int, float]]:
+    """[(categoria, n_boletas, monto)] solo de las categorías con registros."""
+    acc: Dict[str, List[float]] = {}
+    for r in registros:
+        cat = (str(r.get("categoria") or "").strip()) or "Sin categoría"
+        a = acc.setdefault(cat, [0, 0.0])
+        a[0] += 1
+        a[1] += float(r.get("Monto") or 0.0)
+    return sorted(((k, int(v[0]), v[1]) for k, v in acc.items()), key=lambda t: (-t[2], t[0]))
+
 # ───────────── Firestore lectura / normalización ─────────────
 def fetch_registros(
     collection_name: str = "registros",
@@ -290,8 +333,11 @@ def write_excel_from_template(
     endDC: Optional[datetime] = meta.get("endDateCampana")
     montoTotal = meta.get("montoTotal") or 0.0
 
-    ws["C4"] = nameCampana
-    ws["C5"] = namePersona
+    fechaRend: datetime = meta.get("fechaRendicion") or datetime.now(TZ_CHILE)
+
+    ws["C4"] = meta.get("codProy") or nameCampana
+    ws["C5"] = meta.get("responsable") or namePersona
+    ws["C6"] = _to_ddmmyyyy(fechaRend)
     if startDC: ws["E4"] = _to_ddmmyyyy(startDC)
     if endDC:   ws["E5"] = _to_ddmmyyyy(endDC)
     ws["E7"] = _clean_monto(montoTotal)
@@ -300,7 +346,15 @@ def write_excel_from_template(
     n = len(registros)
 
     if n >= 2:
-        ws.insert_rows(start_row + 1, amount=n - 1)
+        # insert_rows no mueve las celdas combinadas: se desplazan a mano
+        shift = n - 1
+        below = [mr for mr in list(ws.merged_cells.ranges) if mr.min_row > start_row]
+        for mr in below:
+            ws.unmerge_cells(str(mr))
+        ws.insert_rows(start_row + 1, amount=shift)
+        for mr in below:
+            ws.merge_cells(start_row=mr.min_row + shift, end_row=mr.max_row + shift,
+                           start_column=mr.min_col, end_column=mr.max_col)
 
     for r in range(start_row, start_row + max(n, 1)):
         _copy_row_style(ws, start_row, r, used_cols)
@@ -332,14 +386,14 @@ def write_excel_from_template(
     except Exception: prev_fmt = None
 
     if n >= 1:
-        ws[sum_cell].value = f"=SUMA({gasto_col_letter}{first_row}:{gasto_col_letter}{last_row})"
+        ws[sum_cell].value = f"=SUM({gasto_col_letter}{first_row}:{gasto_col_letter}{last_row})"
     else:
         ws[sum_cell].value = 0
     if prev_fmt:
         try: ws[sum_cell].number_format = prev_fmt
         except Exception: pass
 
-    # G14 = SUMA(...)
+    # G14 = SUM(...)
     g14_new_row = 14 + max(n - 1, 0)
     g14_cell    = f"G{g14_new_row}"
     ws[g14_cell].value = f"={sum_cell}"
@@ -410,11 +464,169 @@ def download_images_grouped_by_date(
     grouped = dict(sorted(grouped.items(), key=lambda kv: _key(kv[0])))
     return grouped
 
-def build_pdf_from_grouped_images(grouped: Dict[str, List[Path]], out_pdf: Union[str, Path]) -> Path:
+def _fit_text(c, text: str, font: str, size: float, max_w: float) -> str:
+    text = str(text)
+    if c.stringWidth(text, font, size) <= max_w:
+        return text
+    while text and c.stringWidth(text + "…", font, size) > max_w:
+        text = text[:-1]
+    return text + "…"
+
+def _franja_ams(c, x: float, y: float, w: float, h: float = 4) -> None:
+    seg = w / 3
+    for i, col in enumerate((AMS_VERDE, AMS_AMARILLO, AMS_AZUL)):
+        c.setFillColor(HexColor(col)); c.rect(x + i * seg, y, seg, h, stroke=0, fill=1)
+
+def draw_separador_fecha(c, fecha_key: str, n_fotos: int) -> None:
+    """Página que separa las boletas de cada día."""
+    pw, ph = A4
+    mx = 48
+    if LOGO_PATH.exists():
+        try:
+            with PILImage.open(LOGO_PATH) as im:
+                lw, lh = im.size
+            w = 90; h = w * lh / lw
+            c.drawImage(ImageReader(str(LOGO_PATH)), mx, ph - 40 - h, width=w, height=h, mask="auto")
+        except Exception:
+            traceback.print_exc()
+    try:
+        dt = datetime.strptime(fecha_key, "%d-%m-%Y")
+        largo = f"{dt.day} de {mes_es(dt)} de {dt.year}"
+    except Exception:
+        largo = ""
+    cy = ph / 2
+    c.setFillColor(HexColor("#8A8C8E")); c.setFont("Helvetica", 11)
+    c.drawCentredString(pw / 2, cy + 58, "BOLETAS DEL DÍA")
+    c.setFillColor(HexColor(AMS_GRIS)); c.setFont("Helvetica-Bold", 40)
+    c.drawCentredString(pw / 2, cy + 12, fecha_key)
+    _franja_ams(c, pw / 2 - 130, cy - 10, 260, 5)
+    c.setFillColor(HexColor("#8A8C8E")); c.setFont("Helvetica", 12)
+    pie = f"{n_fotos} respaldo" + ("" if n_fotos == 1 else "s")
+    c.drawCentredString(pw / 2, cy - 36, f"{largo}  ·  {pie}" if largo else pie)
+    c.setFillColor(HexColor("#000000"))
+    c.showPage()
+
+def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
+    pw, ph = A4
+    mx = 48
+    azul = HexColor(AMS_GRIS)          # color principal (títulos, tabla)
+    gris, claro, linea = HexColor("#8A8C8E"), HexColor("#F4F5F5"), HexColor("#D9DADB")
+    verde, amarillo, celeste = HexColor(AMS_VERDE), HexColor(AMS_AMARILLO), HexColor(AMS_AZUL)
+    rojo = HexColor("#C0392B")
+
+    # Encabezado: logo a la izquierda, título a la derecha, franja tricolor
+    if LOGO_PATH.exists():
+        try:
+            with PILImage.open(LOGO_PATH) as im:
+                lw, lh = im.size
+            w = 150; h = w * lh / lw
+            c.drawImage(ImageReader(str(LOGO_PATH)), mx, ph - 40 - h, width=w, height=h, mask="auto")
+        except Exception:
+            traceback.print_exc()
+    c.setFillColor(azul)
+    c.setFont("Helvetica-Bold", 22); c.drawRightString(pw - mx, ph - 78, "Rendición de Fondos")
+    c.setFillColor(gris)
+    c.setFont("Helvetica", 10.5);    c.drawRightString(pw - mx, ph - 96, "Respaldo de boletas y facturas")
+    _franja_ams(c, mx, ph - 136, pw - 2 * mx)
+
+    # Datos de cabecera
+    startDC, endDC = meta.get("startDateCampana"), meta.get("endDateCampana")
+    fechaRend = meta.get("fechaRendicion") or datetime.now(TZ_CHILE)
+    campos = [
+        ("Código del proyecto",      meta.get("codProy") or "—"),
+        ("Campaña",                  meta.get("nameCampana") or "—"),
+        ("Responsable de rendición", meta.get("responsable") or "—"),
+        ("Fecha de rendición",       _to_ddmmyyyy(fechaRend)),
+    ]
+    if startDC:
+        campos.append(("Período de terreno", f"{_to_ddmmyyyy(startDC)} al {_to_ddmmyyyy(endDC or startDC)}"))
+
+    y = ph - 170
+    for i, (lab, val) in enumerate(campos):
+        c.setFillColor(gris); c.setFont("Helvetica", 9)
+        c.drawString(mx, y, lab.upper())
+        c.setFillColor(azul if i == 0 else HexColor("#111111"))
+        fsz = 20 if i == 0 else 13
+        c.setFont("Helvetica-Bold", fsz)
+        c.drawString(mx, y - fsz - 2, _fit_text(c, val, "Helvetica-Bold", fsz, pw - 2 * mx))
+        y -= fsz + 28
+
+    # Tarjetas de resumen
+    resumen = resumen_por_categoria(registros)
+    gastado = sum(m for _, _, m in resumen)
+    asignado = _clean_monto(meta.get("montoTotal"))
+    saldo = asignado - gastado
+    tarjetas = [("MONTO TOTAL", asignado, azul, celeste), ("TOTAL GASTADO", gastado, azul, amarillo),
+                ("SALDO", saldo, rojo if saldo < 0 else azul, rojo if saldo < 0 else verde)]
+    gap = 12; cw = (pw - 2 * mx - 2 * gap) / 3; chh = 58
+    y -= 6
+    for i, (lab, val, col, acento) in enumerate(tarjetas):
+        x = mx + i * (cw + gap)
+        c.setFillColor(claro);  c.rect(x, y - chh, cw, chh, stroke=0, fill=1)
+        c.setFillColor(acento); c.rect(x, y - chh, 4, chh, stroke=0, fill=1)
+        c.setFillColor(gris); c.setFont("Helvetica", 8.5); c.drawString(x + 12, y - 18, lab)
+        c.setFillColor(col);  c.setFont("Helvetica-Bold", 16); c.drawString(x + 12, y - 42, _fmt_clp(val))
+    y -= chh + 30
+
+    # Tabla por categoría
+    x0, x1 = mx, pw - mx
+    xb, xg = x1 - 230, x1 - 120     # columnas: boletas, monto gastado (monto total va al borde)
+    rh = 22
+    c.setFillColor(azul); c.rect(x0, y - rh, x1 - x0, rh, stroke=0, fill=1)
+    c.setFillColor(white); c.setFont("Helvetica-Bold", 10)
+    c.drawString(x0 + 10, y - 15, "Categoría")
+    c.drawRightString(xb, y - 15, "N° boletas")
+    c.drawRightString(xg, y - 15, "Monto gastado")
+    c.drawRightString(x1 - 10, y - 15, "Monto total")
+    y -= rh
+
+    if not resumen:
+        c.setFillColor(gris); c.setFont("Helvetica-Oblique", 10)
+        c.drawString(x0 + 10, y - 15, "Sin registros de gasto"); y -= rh
+    for i, (cat, nb, monto) in enumerate(resumen):
+        if y - rh < 110:      # no pisar el pie de página
+            c.setFillColor(gris); c.setFont("Helvetica-Oblique", 9)
+            c.drawString(x0 + 10, y - 14, f"… y {len(resumen) - i} categorías más (ver Excel)"); y -= rh
+            break
+        if i % 2 == 1:
+            c.setFillColor(claro); c.rect(x0, y - rh, x1 - x0, rh, stroke=0, fill=1)
+        c.setFillColor(HexColor("#111111")); c.setFont("Helvetica", 10)
+        c.drawString(x0 + 10, y - 15, _fit_text(c, cat, "Helvetica", 10, xb - x0 - 80))
+        c.drawRightString(xb, y - 15, str(nb))
+        c.drawRightString(xg, y - 15, _fmt_clp(monto))
+        y -= rh
+
+    # Filas de totales
+    c.setStrokeColor(azul); c.setLineWidth(1.2); c.line(x0, y, x1, y)
+    c.setFillColor(azul); c.setFont("Helvetica-Bold", 10.5)
+    c.drawString(x0 + 10, y - 15, "Total")
+    c.drawRightString(xb, y - 15, str(len(registros)))
+    c.drawRightString(xg, y - 15, _fmt_clp(gastado))
+    c.drawRightString(x1 - 10, y - 15, _fmt_clp(asignado))
+    y -= rh
+    c.setStrokeColor(linea); c.setLineWidth(0.6); c.line(x0, y, x1, y)
+
+    # Pie
+    c.setStrokeColor(linea); c.line(mx, 60, pw - mx, 60)
+    c.setFillColor(gris); c.setFont("Helvetica", 8.5)
+    c.drawString(mx, 46, f"Generado el {fechaRend.strftime('%d-%m-%Y %H:%M')}")
+    c.drawRightString(pw - mx, 46, f"{len(registros)} registros")
+    c.setFillColor(HexColor("#000000")); c.setStrokeColor(HexColor("#000000")); c.setLineWidth(1)
+    c.showPage()
+
+def build_pdf_from_grouped_images(
+    grouped: Dict[str, List[Path]],
+    out_pdf: Union[str, Path],
+    meta: Optional[Dict[str, Any]] = None,
+    registros: Optional[List[dict]] = None,
+) -> Path:
     out_pdf = _unique_path(Path(out_pdf))
     c = canvas.Canvas(str(out_pdf), pagesize=A4)
     pw, ph = A4
     margin = 36
+
+    if meta is not None:
+        draw_portada(c, meta, registros or [])
 
     if not grouped:
         c.setFont("Helvetica-Bold", 18)
@@ -424,9 +636,7 @@ def build_pdf_from_grouped_images(grouped: Dict[str, List[Path]], out_pdf: Union
         return out_pdf
 
     for fecha_key, paths in grouped.items():
-        c.setFont("Helvetica-Bold", 20)
-        c.drawCentredString(pw / 2, ph / 2, fecha_key)
-        c.showPage()
+        draw_separador_fecha(c, fecha_key, len(paths))
         for p in paths:
             try:
                 with PILImage.open(p) as im:
@@ -463,6 +673,15 @@ def generar_rendicion_bundle(
         campana_id=campana_id,
     )
 
+    # Cabecera desde la colección "campana" (con respaldo en lo que venga en registros)
+    camp = fetch_campana(campana_id)
+    meta["codProy"]        = camp.get("codProy") or meta["nameCampana"]
+    meta["nameCampana"]    = camp.get("name") or meta["nameCampana"]
+    meta["responsable"]    = camp.get("responsable") or meta["namePersona"]
+    meta["fechaRendicion"] = datetime.now(TZ_CHILE)
+    if camp.get("montoTotal") is not None:
+        meta["montoTotal"] = _clean_monto(camp.get("montoTotal"))
+
     excel_out = write_excel_from_template(template, registros, meta, start_row=start_row, sheet_name=sheet_name)
     _, gcs_client = init_clients()
     grouped = download_images_grouped_by_date(registros, gcs_client, out_dir=fotos_dir, max_workers=8)
@@ -477,7 +696,7 @@ def generar_rendicion_bundle(
     else:
         pdf_name = "Rendicion_Fotos.pdf"
 
-    pdf_out = build_pdf_from_grouped_images(grouped, OUTPUT_DIR / pdf_name)
+    pdf_out = build_pdf_from_grouped_images(grouped, OUTPUT_DIR / pdf_name, meta=meta, registros=registros)
     return excel_out, pdf_out
 
 # ───────────────────────────────── Endpoints ────────────────────────────────
@@ -526,5 +745,3 @@ def download_file(kind: str, filename: str):
     return FileResponse(path=str(file_path), media_type=media, filename=file_path.name)
 
 # (en Render: START ➜ uvicorn app:app --host 0.0.0.0 --port $PORT)
-
-
