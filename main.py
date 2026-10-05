@@ -546,6 +546,7 @@ def draw_separador_fecha(c, fecha_key: str, n_fotos: int) -> None:
     c.setFillColor(HexColor("#000000"))
     c.showPage()
 
+
 def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
     pw, ph = A4
     mx = 48
@@ -553,7 +554,7 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
     gris, claro, linea = HexColor("#8A8C8E"), HexColor("#F4F5F5"), HexColor("#D9DADB")
     verde, amarillo, celeste = HexColor(AMS_VERDE), HexColor(AMS_AMARILLO), HexColor(AMS_AZUL)
     rojo = HexColor("#C0392B")
-
+ 
     # Encabezado: logo a la izquierda, título a la derecha, franja tricolor
     if LOGO_PATH.exists():
         try:
@@ -568,7 +569,7 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
     c.setFillColor(gris)
     c.setFont("Helvetica", 10.5);    c.drawRightString(pw - mx, ph - 96, "Respaldo de boletas y facturas")
     _franja_ams(c, mx, ph - 136, pw - 2 * mx)
-
+ 
     # Datos de cabecera
     startDC, endDC = meta.get("startDateCampana"), meta.get("endDateCampana")
     fechaRend = meta.get("fechaRendicion") or datetime.now(TZ_CHILE)
@@ -583,7 +584,7 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
         periodo = f"{_to_ddmmyyyy(startDC)} al {_to_ddmmyyyy(endDC or startDC)}"
     if periodo:
         campos.append(("Período de terreno", periodo))
-
+ 
     y = ph - 170
     for i, (lab, val) in enumerate(campos):
         c.setFillColor(gris); c.setFont("Helvetica", 9)
@@ -594,76 +595,113 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
         c.setFont("Helvetica-Bold", fsz)
         c.drawString(mx, y - fsz - 2, _fit_text(c, val, "Helvetica-Bold", fsz, pw - 2 * mx))
         y -= fsz + 28
-
-    # Tarjetas de resumen
+ 
+    # ── Datos de la tabla ──
     resumen = resumen_por_categoria(registros)
     gastado = sum(m for _, _, m in resumen)
     asignados: Dict[str, float] = meta.get("montosCategoria") or {}
     saldos: Dict[str, float] = meta.get("saldosCategoria") or {}
     asignado = _clean_monto(meta.get("montoTotal"))
     saldo = saldos["total"] if "total" in saldos else asignado - gastado
-    tarjetas = [("MONTO TOTAL", asignado, azul, celeste), ("TOTAL GASTADO", gastado, azul, amarillo),
-                ("SALDO", saldo, rojo if saldo < 0 else azul, rojo if saldo < 0 else verde)]
-    gap = 12; cw = (pw - 2 * mx - 2 * gap) / 3; chh = 58
+ 
+    # Filas: (categoria, n_boletas, gastado, asignado, saldo, a_devolver)
+    # "Monto a devolver" = saldo con piso en 0: el sobregiro lo asume el profesional.
+    filas: List[Tuple[str, int, float, Optional[float], Optional[float], Optional[float]]] = []
+    vistas = set()
+    for cat, nb, monto in resumen:
+        vistas.add(_slug_categoria(cat).lower().rstrip("s"))
+        asig = _buscar_categoria(asignados, cat)
+        sal = _buscar_categoria(saldos, cat)
+        if sal is None and asig is not None:
+            sal = asig - monto
+        dev = max(sal, 0.0) if sal is not None else None
+        filas.append((cat, nb, monto, asig, sal, dev))
+ 
+    # Categorías con monto asignado pero sin boletas: su saldo completo también se devuelve,
+    # así que deben estar en la tabla para que la suma de "Monto a devolver" sea correcta.
+    for k in sorted(set(asignados) | set(saldos)):
+        if k == "total" or k.rstrip("s") in vistas:
+            continue
+        vistas.add(k.rstrip("s"))
+        asig = _buscar_categoria(asignados, k)
+        sal = _buscar_categoria(saldos, k)
+        if sal is None:
+            sal = asig
+        if not asig and not sal:
+            continue
+        filas.append((k[:1].upper() + k[1:], 0, 0.0, asig, sal, max(sal or 0.0, 0.0)))
+ 
+    devs = [f[5] for f in filas if f[5] is not None]
+    # Sin datos por categoría: se usa el saldo global con piso en 0
+    a_devolver = sum(devs) if devs else max(saldo, 0.0)
+ 
+    # Tarjetas de resumen
+    tarjetas = [("MONTO ASIGNADO", asignado, azul, celeste), ("TOTAL GASTADO", gastado, azul, amarillo),
+                ("SALDO", saldo, rojo if saldo < 0 else azul, rojo if saldo < 0 else celeste),
+                ("MONTO A DEVOLVER", a_devolver, azul, verde)]
+    gap = 10; cw = (pw - 2 * mx - 3 * gap) / 4; chh = 58
     y -= 6
     for i, (lab, val, col, acento) in enumerate(tarjetas):
         x = mx + i * (cw + gap)
         c.setFillColor(claro);  c.rect(x, y - chh, cw, chh, stroke=0, fill=1)
         c.setFillColor(acento); c.rect(x, y - chh, 4, chh, stroke=0, fill=1)
         c.setFillColor(gris); c.setFont("Helvetica", 8.5); c.drawString(x + 12, y - 18, lab)
-        c.setFillColor(col);  c.setFont("Helvetica-Bold", 16); c.drawString(x + 12, y - 42, _fmt_clp(val))
+        c.setFillColor(col);  c.setFont("Helvetica-Bold", 14); c.drawString(x + 12, y - 42, _fmt_clp(val))
     y -= chh + 30
-
+ 
     # Tabla por categoría
     x0, x1 = mx, pw - mx
-    xb, xg, xt = x1 - 290, x1 - 195, x1 - 100     # columnas: boletas, gastado, total (saldo va al borde)
+    # columnas (alineadas a la derecha): boletas, gastado, asignado, saldo, a devolver
+    xb, xg, xt, xs, xd = x1 - 317, x1 - 242, x1 - 162, x1 - 97, x1 - 10
     rh = 22
+    negro = HexColor("#111111")
     c.setFillColor(azul); c.rect(x0, y - rh, x1 - x0, rh, stroke=0, fill=1)
-    c.setFillColor(white); c.setFont("Helvetica-Bold", 10)
+    c.setFillColor(white); c.setFont("Helvetica-Bold", 9)
     c.drawString(x0 + 10, y - 15, "Categoría")
     c.drawRightString(xb, y - 15, "N° boletas")
     c.drawRightString(xg, y - 15, "Monto gastado")
-    c.drawRightString(xt, y - 15, "Monto total")
-    c.drawRightString(x1 - 10, y - 15, "Saldo")
+    c.drawRightString(xt, y - 15, "Monto asignado")
+    c.drawRightString(xs, y - 15, "Saldo")
+    c.drawRightString(xd, y - 15, "Monto a devolver")
     y -= rh
-
-    if not resumen:
+ 
+    if not filas:
         c.setFillColor(gris); c.setFont("Helvetica-Oblique", 10)
         c.drawString(x0 + 10, y - 15, "Sin registros de gasto"); y -= rh
-    for i, (cat, nb, monto) in enumerate(resumen):
+    for i, (cat, nb, monto, asig, sal, dev) in enumerate(filas):
         if y - rh < 110:      # no pisar el pie de página
             c.setFillColor(gris); c.setFont("Helvetica-Oblique", 9)
-            c.drawString(x0 + 10, y - 14, f"… y {len(resumen) - i} categorías más (ver Excel)"); y -= rh
+            c.drawString(x0 + 10, y - 14, f"… y {len(filas) - i} categorías más (ver Excel)"); y -= rh
             break
         if i % 2 == 1:
             c.setFillColor(claro); c.rect(x0, y - rh, x1 - x0, rh, stroke=0, fill=1)
-        c.setFillColor(HexColor("#111111")); c.setFont("Helvetica", 10)
-        c.drawString(x0 + 10, y - 15, _fit_text(c, cat, "Helvetica", 10, xb - x0 - 80))
+        c.setFillColor(negro); c.setFont("Helvetica", 9.5)
+        c.drawString(x0 + 10, y - 15, _fit_text(c, cat, "Helvetica", 9.5, xb - x0 - 65))
         c.drawRightString(xb, y - 15, str(nb))
         c.drawRightString(xg, y - 15, _fmt_clp(monto))
-        asig = _buscar_categoria(asignados, cat)
         c.drawRightString(xt, y - 15, _fmt_clp(asig) if asig is not None else "—")
-        sal = _buscar_categoria(saldos, cat)
-        if sal is None and asig is not None:
-            sal = asig - monto
         if sal is not None and sal < 0:
             c.setFillColor(rojo)
-        c.drawRightString(x1 - 10, y - 15, _fmt_clp(sal) if sal is not None else "—")
+        c.drawRightString(xs, y - 15, _fmt_clp(sal) if sal is not None else "—")
+        c.setFillColor(negro)
+        c.drawRightString(xd, y - 15, _fmt_clp(dev) if dev is not None else "—")
         y -= rh
-
-    # Filas de totales
+ 
+    # Fila de totales
     c.setStrokeColor(azul); c.setLineWidth(1.2); c.line(x0, y, x1, y)
-    c.setFillColor(azul); c.setFont("Helvetica-Bold", 10.5)
+    c.setFillColor(azul); c.setFont("Helvetica-Bold", 10)
     c.drawString(x0 + 10, y - 15, "Total")
     c.drawRightString(xb, y - 15, str(len(registros)))
     c.drawRightString(xg, y - 15, _fmt_clp(gastado))
     c.drawRightString(xt, y - 15, _fmt_clp(asignado))
     if saldo < 0:
         c.setFillColor(rojo)
-    c.drawRightString(x1 - 10, y - 15, _fmt_clp(saldo))
+    c.drawRightString(xs, y - 15, _fmt_clp(saldo))
+    c.setFillColor(azul)
+    c.drawRightString(xd, y - 15, _fmt_clp(a_devolver))
     y -= rh
     c.setStrokeColor(linea); c.setLineWidth(0.6); c.line(x0, y, x1, y)
-
+ 
     # Pie
     c.setStrokeColor(linea); c.line(mx, 60, pw - mx, 60)
     c.setFillColor(gris); c.setFont("Helvetica", 8.5)
