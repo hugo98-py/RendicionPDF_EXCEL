@@ -29,7 +29,7 @@ from google.cloud import storage as gcs
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
-from openpyxl.styles import Border, Side
+from openpyxl.styles import Alignment, Border, Font, Side
 
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
@@ -349,6 +349,96 @@ def _copy_row_style(ws, src_row: int, dst_row: int, cols: list[int]) -> None:
             try: dst.number_format = src.number_format
             except Exception: pass
 
+NOTA_EXCEDENTES = (
+    "Nota: cuando el gasto de una categoría supera su monto asignado, la diferencia "
+    "(excedente) no se incluye en el Total Gastado de esta rendición. Dicho excedente es asumido "
+    "por el profesional que rinde, de modo que se respetan los montos asignados a cada categoría "
+    "y el Saldo favor / Contra refleja el monto efectivo a devolver."
+)
+
+def _write_detalle_excedentes(
+    ws: Worksheet, registros: List[dict], meta: Dict[str, Any], top_row: int,
+    first_row: int, last_row: int, detalle_col: str, gasto_col: str,
+) -> Optional[str]:
+    """Escribe en I:L el cuadro 'Detalle de excedentes por categoría' y la nota.
+    Devuelve la celda con el total de excedentes, o None si la campaña no tiene
+    montos asignados por categoría (en ese caso no se escribe nada)."""
+    asignados: Dict[str, float] = meta.get("montosCategoria") or {}
+    if not asignados:
+        return None
+
+    # (categoria, asignado, gastado): primero las que tienen gastos, luego las asignadas sin gastos
+    filas: List[Tuple[str, float, float]] = []
+    vistas = set()
+    for cat, _, monto in resumen_por_categoria(registros):
+        vistas.add(_slug_categoria(cat).lower().rstrip("s"))
+        filas.append((cat, _buscar_categoria(asignados, cat) or 0.0, monto))
+    for k in sorted(asignados):
+        if k == "total" or k.rstrip("s") in vistas or not asignados[k]:
+            continue
+        vistas.add(k.rstrip("s"))
+        filas.append((k[:1].upper() + k[1:], asignados[k], 0.0))
+
+    lab, val = ws.cell(row=top_row + 1, column=6), ws.cell(row=top_row + 1, column=7)   # estilo naranja
+    plain = ws.cell(row=first_row, column=7)
+    thin, med = Side(style="thin", color="000000"), Side(style="medium", color="000000")
+    b_thin = Border(left=thin, right=thin, top=thin, bottom=thin)
+    b_med  = Border(left=med, right=med, top=med, bottom=med)
+
+    def _naranja(c, border, centrado=False):
+        f = copy(lab.font); f.b = True
+        c.font = f; c.fill = copy(lab.fill); c.border = border
+        if centrado:
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    ws.merge_cells(start_row=top_row, start_column=9, end_row=top_row, end_column=12)
+    ws.cell(row=top_row, column=9).value = "Detalle de excedentes por categoría"
+    for col in range(9, 13):
+        _naranja(ws.cell(row=top_row, column=col), b_med, True)
+    for j, h in enumerate(("Categoría", "Monto asignado", "Monto gastado", "Excedente")):
+        c = ws.cell(row=top_row + 1, column=9 + j); c.value = h
+        _naranja(c, b_thin, True)
+
+    r0 = top_row + 2
+    rng_det = f"${detalle_col}${first_row}:${detalle_col}${last_row}"
+    rng_gas = f"${gasto_col}${first_row}:${gasto_col}${last_row}"
+    for i, (cat, asig, monto) in enumerate(filas):
+        r = r0 + i
+        ws.cell(row=r, column=9).value = cat
+        ws.cell(row=r, column=10).value = float(asig)
+        # "Sin categoría" no existe como texto en la columna Detalle: se escribe el valor
+        ws.cell(row=r, column=11).value = (
+            float(monto) if cat == "Sin categoría" else f"=SUMIF({rng_det},I{r},{rng_gas})"
+        )
+        ws.cell(row=r, column=12).value = f"=MAX(K{r}-J{r},0)"
+        for col in range(9, 13):
+            c = ws.cell(row=r, column=col)
+            c.font = copy(plain.font); c.border = b_thin
+            if col > 9: c.number_format = plain.number_format
+    r1 = r0 + len(filas) - 1
+    tr = r1 + 1
+    ws.cell(row=tr, column=9).value = "Total"
+    for L in "JKL":
+        ws[f"{L}{tr}"].value = f"=SUM({L}{r0}:{L}{r1})" if filas else 0
+    for col in range(9, 13):
+        c = ws.cell(row=tr, column=col)
+        _naranja(c, b_med)
+        if col > 9: c.number_format = val.number_format
+
+    nr = tr + 2
+    ws.merge_cells(start_row=nr, start_column=9, end_row=nr + 3, end_column=12)
+    nota = ws.cell(row=nr, column=9); nota.value = NOTA_EXCEDENTES
+    nota.font = Font(name="Arial", size=9, italic=True)
+    nota.alignment = Alignment(wrap_text=True, vertical="top")
+
+    for L, w in zip("HIJKL", (3, 18, 16, 16, 14)):
+        ws.column_dimensions[L].width = w
+    ws.print_area = f"A1:L{nr + 3}"
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1; ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    return f"L{tr}"
+
 def write_excel_from_template(
     template_path: Union[str, Path],
     registros: List[dict],
@@ -433,16 +523,26 @@ def write_excel_from_template(
         try: ws[sum_cell].number_format = prev_fmt
         except Exception: pass
 
-    # G14 = SUM(...)
+    # Cuadro naranja: Total Gastado (G14), Fondo Asignado (G15), Saldo favor / Contra (G16)
     g14_new_row = 14 + max(n - 1, 0)
     g14_cell    = f"G{g14_new_row}"
-    ws[g14_cell].value = f"={sum_cell}"
+    g16_new_row = 16 + max(n - 1, 0)
+    g16_cell    = f"G{g16_new_row}"
+
+    # Detalle de excedentes por categoría (a la derecha del cuadro naranja).
+    # El sobregiro de una categoría lo asume el profesional: se descuenta del Total Gastado.
+    exc_total_cell = _write_detalle_excedentes(
+        ws, registros, meta, top_row=g14_new_row - 1,
+        first_row=first_row, last_row=last_row,
+        detalle_col=get_column_letter(cols["Detalle"]), gasto_col=gasto_col_letter,
+    )
+
+    # G14 = suma de comprobantes menos excedentes (o la suma tal cual si no hay montos por categoría)
+    ws[g14_cell].value = f"={sum_cell}-{exc_total_cell}" if exc_total_cell else f"={sum_cell}"
     try: ws[g14_cell].number_format = ws[sum_cell].number_format
     except Exception: pass
 
     # G16 = E7 - G14
-    g16_new_row = 16 + max(n - 1, 0)
-    g16_cell    = f"G{g16_new_row}"
     ws[g16_cell].value = f"=E7-{g14_cell}"
     try: ws[g16_cell].number_format = ws[g14_cell].number_format
     except Exception: pass
@@ -546,7 +646,6 @@ def draw_separador_fecha(c, fecha_key: str, n_fotos: int) -> None:
     c.setFillColor(HexColor("#000000"))
     c.showPage()
 
-
 def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
     pw, ph = A4
     mx = 48
@@ -554,7 +653,7 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
     gris, claro, linea = HexColor("#8A8C8E"), HexColor("#F4F5F5"), HexColor("#D9DADB")
     verde, amarillo, celeste = HexColor(AMS_VERDE), HexColor(AMS_AMARILLO), HexColor(AMS_AZUL)
     rojo = HexColor("#C0392B")
- 
+
     # Encabezado: logo a la izquierda, título a la derecha, franja tricolor
     if LOGO_PATH.exists():
         try:
@@ -569,7 +668,7 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
     c.setFillColor(gris)
     c.setFont("Helvetica", 10.5);    c.drawRightString(pw - mx, ph - 96, "Respaldo de boletas y facturas")
     _franja_ams(c, mx, ph - 136, pw - 2 * mx)
- 
+
     # Datos de cabecera
     startDC, endDC = meta.get("startDateCampana"), meta.get("endDateCampana")
     fechaRend = meta.get("fechaRendicion") or datetime.now(TZ_CHILE)
@@ -584,7 +683,7 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
         periodo = f"{_to_ddmmyyyy(startDC)} al {_to_ddmmyyyy(endDC or startDC)}"
     if periodo:
         campos.append(("Período de terreno", periodo))
- 
+
     y = ph - 170
     for i, (lab, val) in enumerate(campos):
         c.setFillColor(gris); c.setFont("Helvetica", 9)
@@ -595,7 +694,7 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
         c.setFont("Helvetica-Bold", fsz)
         c.drawString(mx, y - fsz - 2, _fit_text(c, val, "Helvetica-Bold", fsz, pw - 2 * mx))
         y -= fsz + 28
- 
+
     # ── Datos de la tabla ──
     resumen = resumen_por_categoria(registros)
     gastado = sum(m for _, _, m in resumen)
@@ -603,7 +702,7 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
     saldos: Dict[str, float] = meta.get("saldosCategoria") or {}
     asignado = _clean_monto(meta.get("montoTotal"))
     saldo = saldos["total"] if "total" in saldos else asignado - gastado
- 
+
     # Filas: (categoria, n_boletas, gastado, asignado, saldo, a_devolver)
     # "Monto a devolver" = saldo con piso en 0: el sobregiro lo asume el profesional.
     filas: List[Tuple[str, int, float, Optional[float], Optional[float], Optional[float]]] = []
@@ -616,7 +715,7 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
             sal = asig - monto
         dev = max(sal, 0.0) if sal is not None else None
         filas.append((cat, nb, monto, asig, sal, dev))
- 
+
     # Categorías con monto asignado pero sin boletas: su saldo completo también se devuelve,
     # así que deben estar en la tabla para que la suma de "Monto a devolver" sea correcta.
     for k in sorted(set(asignados) | set(saldos)):
@@ -630,11 +729,11 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
         if not asig and not sal:
             continue
         filas.append((k[:1].upper() + k[1:], 0, 0.0, asig, sal, max(sal or 0.0, 0.0)))
- 
+
     devs = [f[5] for f in filas if f[5] is not None]
     # Sin datos por categoría: se usa el saldo global con piso en 0
     a_devolver = sum(devs) if devs else max(saldo, 0.0)
- 
+
     # Tarjetas de resumen
     tarjetas = [("MONTO ASIGNADO", asignado, azul, celeste), ("TOTAL GASTADO", gastado, azul, amarillo),
                 ("SALDO", saldo, rojo if saldo < 0 else azul, rojo if saldo < 0 else celeste),
@@ -648,7 +747,7 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
         c.setFillColor(gris); c.setFont("Helvetica", 8.5); c.drawString(x + 12, y - 18, lab)
         c.setFillColor(col);  c.setFont("Helvetica-Bold", 14); c.drawString(x + 12, y - 42, _fmt_clp(val))
     y -= chh + 30
- 
+
     # Tabla por categoría
     x0, x1 = mx, pw - mx
     # columnas (alineadas a la derecha): boletas, gastado, asignado, saldo, a devolver
@@ -664,7 +763,7 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
     c.drawRightString(xs, y - 15, "Saldo")
     c.drawRightString(xd, y - 15, "Monto a devolver")
     y -= rh
- 
+
     if not filas:
         c.setFillColor(gris); c.setFont("Helvetica-Oblique", 10)
         c.drawString(x0 + 10, y - 15, "Sin registros de gasto"); y -= rh
@@ -686,7 +785,7 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
         c.setFillColor(negro)
         c.drawRightString(xd, y - 15, _fmt_clp(dev) if dev is not None else "—")
         y -= rh
- 
+
     # Fila de totales
     c.setStrokeColor(azul); c.setLineWidth(1.2); c.line(x0, y, x1, y)
     c.setFillColor(azul); c.setFont("Helvetica-Bold", 10)
@@ -701,7 +800,7 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
     c.drawRightString(xd, y - 15, _fmt_clp(a_devolver))
     y -= rh
     c.setStrokeColor(linea); c.setLineWidth(0.6); c.line(x0, y, x1, y)
- 
+
     # Pie
     c.setStrokeColor(linea); c.line(mx, 60, pw - mx, 60)
     c.setFillColor(gris); c.setFont("Helvetica", 8.5)
