@@ -362,7 +362,8 @@ def _write_detalle_excedentes(
 ) -> Optional[str]:
     """Escribe en I:L el cuadro 'Detalle de excedentes por categoría' y la nota.
     Devuelve la celda con el total de excedentes, o None si la campaña no tiene
-    montos asignados por categoría (en ese caso no se escribe nada)."""
+    montos asignados por categoría o ninguna categoría tuvo excedente
+    (en esos casos no se escribe nada)."""
     asignados: Dict[str, float] = meta.get("montosCategoria") or {}
     if not asignados:
         return None
@@ -378,6 +379,10 @@ def _write_detalle_excedentes(
             continue
         vistas.add(k.rstrip("s"))
         filas.append((k[:1].upper() + k[1:], asignados[k], 0.0))
+
+    # Sin excedentes en ninguna categoría: no se dibuja el cuadro y el Excel queda normal
+    if not any(monto > asig for _, asig, monto in filas):
+        return None
 
     lab, val = ws.cell(row=top_row + 1, column=6), ws.cell(row=top_row + 1, column=7)   # estilo naranja
     plain = ws.cell(row=first_row, column=7)
@@ -537,7 +542,7 @@ def write_excel_from_template(
         detalle_col=get_column_letter(cols["Detalle"]), gasto_col=gasto_col_letter,
     )
 
-    # G14 = suma de comprobantes menos excedentes (o la suma tal cual si no hay montos por categoría)
+    # G14 = suma de comprobantes menos excedentes (o la suma tal cual si no hay excedentes)
     ws[g14_cell].value = f"={sum_cell}-{exc_total_cell}" if exc_total_cell else f"={sum_cell}"
     try: ws[g14_cell].number_format = ws[sum_cell].number_format
     except Exception: pass
