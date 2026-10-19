@@ -9,7 +9,6 @@ Created on Sun Aug 17 19:40:11 2025
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 import os, re, json, base64, traceback, unicodedata
-from io import BytesIO
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, unquote
@@ -643,14 +642,27 @@ def _fecha_larga(fecha_key: str) -> str:
     except Exception:
         return ""
 
-def _abrir_boleta(p: Path) -> PILImage.Image:
-    """Abre la foto respetando la orientación EXIF (tal como se ve en el teléfono), en RGB/L."""
-    with PILImage.open(p) as im:
-        im = ImageOps.exif_transpose(im)
-        if im.mode not in ("RGB", "L"):
-            im = im.convert("RGB")
-        im.load()
-    return im
+MAX_LADO_BOLETA = 2400   # px; suficiente para leer la boleta y mantiene bajo el uso de memoria
+
+def _preparar_boleta(p: Path) -> Path:
+    """Guarda una copia JPEG derecha (según EXIF, tal como se ve en el teléfono) y de tamaño acotado.
+    El PDF y el Word usan esta copia: se incrusta como JPEG y no como píxeles sin comprimir."""
+    try:
+        with PILImage.open(p) as im:
+            im.draft("RGB", (MAX_LADO_BOLETA, MAX_LADO_BOLETA))   # JPEG: decodifica ya reducida
+            im = ImageOps.exif_transpose(im)
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            im.thumbnail((MAX_LADO_BOLETA, MAX_LADO_BOLETA))
+            out = p.with_name(p.stem + "_ok.jpg")
+            im.save(out, format="JPEG", quality=85)
+        return out
+    except Exception:
+        traceback.print_exc()
+        return p
+
+def preparar_boletas(grouped: Dict[str, List[Path]]) -> Dict[str, List[Path]]:
+    return {k: [_preparar_boleta(p) for p in paths] for k, paths in grouped.items()}
 
 def draw_separador_fecha(c, fecha_key: str, n_fotos: int) -> None:
     """Página que separa las boletas de cada día."""
@@ -876,15 +888,15 @@ def build_pdf_from_grouped_images(
         draw_separador_fecha(c, fecha_key, len(paths))
         for p in paths:
             try:
-                im = _abrir_boleta(p)
-                w, h = im.size
+                with PILImage.open(p) as im:
+                    w, h = im.size
                 max_w = pw - 2 * margin
                 max_h = ph - 2 * margin
                 scale = min(max_w / w, max_h / h)
                 new_w, new_h = w * scale, h * scale
                 x = (pw - new_w) / 2
                 y = (ph - new_h) / 2
-                c.drawImage(ImageReader(im), x, y, width=new_w, height=new_h)
+                c.drawImage(ImageReader(str(p)), x, y, width=new_w, height=new_h)
                 c.showPage()
             except Exception:
                 traceback.print_exc()
@@ -1081,13 +1093,11 @@ def build_docx_from_grouped_images(
         _separador_docx(doc, fecha_key, len(paths))
         for p in paths:
             try:
-                im = _abrir_boleta(p)
-                im.thumbnail((2400, 2400))      # limita el peso del .docx
-                w, h = im.size
+                with PILImage.open(p) as im:
+                    w, h = im.size
                 scale = min(max_w / w, max_h / h)
-                buf = BytesIO(); im.save(buf, format="JPEG", quality=88); buf.seek(0)
                 par = _parrafo(doc, WD_ALIGN_PARAGRAPH.CENTER, nueva_pagina=True)
-                par.add_run().add_picture(buf, width=Emu(int(w * scale)), height=Emu(int(h * scale)))
+                par.add_run().add_picture(str(p), width=Emu(int(w * scale)), height=Emu(int(h * scale)))
             except Exception:
                 traceback.print_exc()
                 continue
@@ -1128,6 +1138,7 @@ def generar_rendicion_bundle(
     excel_out = write_excel_from_template(template, registros, meta, start_row=start_row, sheet_name=sheet_name)
     _, gcs_client = init_clients()
     grouped = download_images_grouped_by_date(registros, gcs_client, out_dir=fotos_dir, max_workers=8)
+    grouped = preparar_boletas(grouped)
 
     startDC = meta.get("startDateCampana")
     endDC = meta.get("endDateCampana") or startDC
