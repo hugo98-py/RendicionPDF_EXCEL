@@ -35,7 +35,7 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
 from reportlab.lib.colors import HexColor, white
-from PIL import Image as PILImage
+from PIL import Image as PILImage, ImageOps
 
 # ───────────────────────────────── CONFIG ──────────────────────────────────
 # Template en el root del repo (override con RENDIDOR_TEMPLATE_PATH)
@@ -840,16 +840,21 @@ def build_pdf_from_grouped_images(
         for p in paths:
             try:
                 with PILImage.open(p) as im:
+                    # Respeta la orientación EXIF (fotos de celular): la deja tal como se ve en el teléfono
+                    im = ImageOps.exif_transpose(im)
+                    if im.mode not in ("RGB", "L"):
+                        im = im.convert("RGB")
                     w, h = im.size
-                max_w = pw - 2 * margin
-                max_h = ph - 2 * margin
-                scale = min(max_w / w, max_h / h)
-                new_w, new_h = w * scale, h * scale
-                x = (pw - new_w) / 2
-                y = (ph - new_h) / 2
-                c.drawImage(ImageReader(str(p)), x, y, width=new_w, height=new_h, preserveAspectRatio=True, anchor='c')
+                    max_w = pw - 2 * margin
+                    max_h = ph - 2 * margin
+                    scale = min(max_w / w, max_h / h)
+                    new_w, new_h = w * scale, h * scale
+                    x = (pw - new_w) / 2
+                    y = (ph - new_h) / 2
+                    c.drawImage(ImageReader(im), x, y, width=new_w, height=new_h)
                 c.showPage()
             except Exception:
+                traceback.print_exc()
                 continue
 
     c.save()
