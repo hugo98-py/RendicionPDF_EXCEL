@@ -9,6 +9,7 @@ Created on Sun Aug 17 19:40:11 2025
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 import os, re, json, base64, traceback, unicodedata
+from io import BytesIO
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, unquote
@@ -36,6 +37,13 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
 from reportlab.lib.colors import HexColor, white
 from PIL import Image as PILImage, ImageOps
+
+from docx import Document
+from docx.enum.table import WD_ALIGN_VERTICAL, WD_ROW_HEIGHT_RULE, WD_TABLE_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Cm, Emu, Pt, RGBColor
 
 # ───────────────────────────────── CONFIG ──────────────────────────────────
 # Template en el root del repo (override con RENDIDOR_TEMPLATE_PATH)
@@ -68,6 +76,11 @@ LOGO_PATH = Path(os.getenv("RENDIDOR_LOGO_PATH", Path(__file__).parent / "logo_a
 TIPO_COMPROBANTE_FIELDS = ("tipoComprobante", "tipo", "comprobante", "tipoDocumento", "tipoDoc", "tipoBoleta")
 
 AMS_GRIS, AMS_VERDE, AMS_AMARILLO, AMS_AZUL = "#58595B", "#7AB573", "#F2DA00", "#84BCE4"
+
+# Word: página A4 con márgenes de 1,5 cm
+MARGEN_DOCX_CM = 1.5
+ANCHO_UTIL_CM  = 21.0 - 2 * MARGEN_DOCX_CM
+ALTO_UTIL_CM   = 29.7 - 2 * MARGEN_DOCX_CM
 
 MESES_ES = [
     "enero","febrero","marzo","abril","mayo","junio",
@@ -622,6 +635,23 @@ def _franja_ams(c, x: float, y: float, w: float, h: float = 4) -> None:
     for i, col in enumerate((AMS_VERDE, AMS_AMARILLO, AMS_AZUL)):
         c.setFillColor(HexColor(col)); c.rect(x + i * seg, y, seg, h, stroke=0, fill=1)
 
+def _fecha_larga(fecha_key: str) -> str:
+    """'05-03-2025' -> '5 de marzo de 2025' ('' si no se puede leer)."""
+    try:
+        dt = datetime.strptime(fecha_key, "%d-%m-%Y")
+        return f"{dt.day} de {mes_es(dt)} de {dt.year}"
+    except Exception:
+        return ""
+
+def _abrir_boleta(p: Path) -> PILImage.Image:
+    """Abre la foto respetando la orientación EXIF (tal como se ve en el teléfono), en RGB/L."""
+    with PILImage.open(p) as im:
+        im = ImageOps.exif_transpose(im)
+        if im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
+        im.load()
+    return im
+
 def draw_separador_fecha(c, fecha_key: str, n_fotos: int) -> None:
     """Página que separa las boletas de cada día."""
     pw, ph = A4
@@ -634,11 +664,7 @@ def draw_separador_fecha(c, fecha_key: str, n_fotos: int) -> None:
             c.drawImage(ImageReader(str(LOGO_PATH)), mx, ph - 40 - h, width=w, height=h, mask="auto")
         except Exception:
             traceback.print_exc()
-    try:
-        dt = datetime.strptime(fecha_key, "%d-%m-%Y")
-        largo = f"{dt.day} de {mes_es(dt)} de {dt.year}"
-    except Exception:
-        largo = ""
+    largo = _fecha_larga(fecha_key)
     cy = ph / 2
     c.setFillColor(HexColor("#8A8C8E")); c.setFont("Helvetica", 11)
     c.drawCentredString(pw / 2, cy + 58, "BOLETAS DEL DÍA")
@@ -651,30 +677,8 @@ def draw_separador_fecha(c, fecha_key: str, n_fotos: int) -> None:
     c.setFillColor(HexColor("#000000"))
     c.showPage()
 
-def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
-    pw, ph = A4
-    mx = 48
-    azul = HexColor(AMS_GRIS)          # color principal (títulos, tabla)
-    gris, claro, linea = HexColor("#8A8C8E"), HexColor("#F4F5F5"), HexColor("#D9DADB")
-    verde, amarillo, celeste = HexColor(AMS_VERDE), HexColor(AMS_AMARILLO), HexColor(AMS_AZUL)
-    rojo = HexColor("#C0392B")
-
-    # Encabezado: logo a la izquierda, título a la derecha, franja tricolor
-    if LOGO_PATH.exists():
-        try:
-            with PILImage.open(LOGO_PATH) as im:
-                lw, lh = im.size
-            w = 150; h = w * lh / lw
-            c.drawImage(ImageReader(str(LOGO_PATH)), mx, ph - 40 - h, width=w, height=h, mask="auto")
-        except Exception:
-            traceback.print_exc()
-    c.setFillColor(azul)
-    c.setFont("Helvetica-Bold", 22); c.drawRightString(pw - mx, ph - 78, "Rendición de Fondos")
-    c.setFillColor(gris)
-    c.setFont("Helvetica", 10.5);    c.drawRightString(pw - mx, ph - 96, "Respaldo de boletas y facturas")
-    _franja_ams(c, mx, ph - 136, pw - 2 * mx)
-
-    # Datos de cabecera
+def _datos_portada(meta: Dict[str, Any], registros: List[dict]) -> Dict[str, Any]:
+    """Datos de la portada (cabecera, tarjetas y tabla por categoría), comunes al PDF y al Word."""
     startDC, endDC = meta.get("startDateCampana"), meta.get("endDateCampana")
     fechaRend = meta.get("fechaRendicion") or datetime.now(TZ_CHILE)
     campos = [
@@ -688,17 +692,6 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
         periodo = f"{_to_ddmmyyyy(startDC)} al {_to_ddmmyyyy(endDC or startDC)}"
     if periodo:
         campos.append(("Período de terreno", periodo))
-
-    y = ph - 170
-    for i, (lab, val) in enumerate(campos):
-        c.setFillColor(gris); c.setFont("Helvetica", 9)
-        c.drawString(mx, y, lab.upper())
-        destacado = i <= 1      # código del proyecto y campaña
-        c.setFillColor(azul if destacado else HexColor("#111111"))
-        fsz = 20 if destacado else 13
-        c.setFont("Helvetica-Bold", fsz)
-        c.drawString(mx, y - fsz - 2, _fit_text(c, val, "Helvetica-Bold", fsz, pw - 2 * mx))
-        y -= fsz + 28
 
     # ── Datos de la tabla ──
     resumen = resumen_por_categoria(registros)
@@ -738,6 +731,50 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
     devs = [f[5] for f in filas if f[5] is not None]
     # Sin datos por categoría: se usa el saldo global con piso en 0
     a_devolver = sum(devs) if devs else max(saldo, 0.0)
+
+    return {
+        "campos": campos, "fechaRend": fechaRend, "filas": filas, "gastado": gastado,
+        "asignado": asignado, "saldo": saldo, "a_devolver": a_devolver,
+    }
+
+def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
+    pw, ph = A4
+    mx = 48
+    azul = HexColor(AMS_GRIS)          # color principal (títulos, tabla)
+    gris, claro, linea = HexColor("#8A8C8E"), HexColor("#F4F5F5"), HexColor("#D9DADB")
+    verde, amarillo, celeste = HexColor(AMS_VERDE), HexColor(AMS_AMARILLO), HexColor(AMS_AZUL)
+    rojo = HexColor("#C0392B")
+
+    d = _datos_portada(meta, registros)
+    campos, fechaRend, filas = d["campos"], d["fechaRend"], d["filas"]
+    gastado, asignado, saldo, a_devolver = d["gastado"], d["asignado"], d["saldo"], d["a_devolver"]
+
+    # Encabezado: logo a la izquierda, título a la derecha, franja tricolor
+    if LOGO_PATH.exists():
+        try:
+            with PILImage.open(LOGO_PATH) as im:
+                lw, lh = im.size
+            w = 150; h = w * lh / lw
+            c.drawImage(ImageReader(str(LOGO_PATH)), mx, ph - 40 - h, width=w, height=h, mask="auto")
+        except Exception:
+            traceback.print_exc()
+    c.setFillColor(azul)
+    c.setFont("Helvetica-Bold", 22); c.drawRightString(pw - mx, ph - 78, "Rendición de Fondos")
+    c.setFillColor(gris)
+    c.setFont("Helvetica", 10.5);    c.drawRightString(pw - mx, ph - 96, "Respaldo de boletas y facturas")
+    _franja_ams(c, mx, ph - 136, pw - 2 * mx)
+
+    # Datos de cabecera
+    y = ph - 170
+    for i, (lab, val) in enumerate(campos):
+        c.setFillColor(gris); c.setFont("Helvetica", 9)
+        c.drawString(mx, y, lab.upper())
+        destacado = i <= 1      # código del proyecto y campaña
+        c.setFillColor(azul if destacado else HexColor("#111111"))
+        fsz = 20 if destacado else 13
+        c.setFont("Helvetica-Bold", fsz)
+        c.drawString(mx, y - fsz - 2, _fit_text(c, val, "Helvetica-Bold", fsz, pw - 2 * mx))
+        y -= fsz + 28
 
     # Tarjetas de resumen
     tarjetas = [("MONTO ASIGNADO", asignado, azul, celeste), ("TOTAL GASTADO", gastado, azul, amarillo),
@@ -839,19 +876,15 @@ def build_pdf_from_grouped_images(
         draw_separador_fecha(c, fecha_key, len(paths))
         for p in paths:
             try:
-                with PILImage.open(p) as im:
-                    # Respeta la orientación EXIF (fotos de celular): la deja tal como se ve en el teléfono
-                    im = ImageOps.exif_transpose(im)
-                    if im.mode not in ("RGB", "L"):
-                        im = im.convert("RGB")
-                    w, h = im.size
-                    max_w = pw - 2 * margin
-                    max_h = ph - 2 * margin
-                    scale = min(max_w / w, max_h / h)
-                    new_w, new_h = w * scale, h * scale
-                    x = (pw - new_w) / 2
-                    y = (ph - new_h) / 2
-                    c.drawImage(ImageReader(im), x, y, width=new_w, height=new_h)
+                im = _abrir_boleta(p)
+                w, h = im.size
+                max_w = pw - 2 * margin
+                max_h = ph - 2 * margin
+                scale = min(max_w / w, max_h / h)
+                new_w, new_h = w * scale, h * scale
+                x = (pw - new_w) / 2
+                y = (ph - new_h) / 2
+                c.drawImage(ImageReader(im), x, y, width=new_w, height=new_h)
                 c.showPage()
             except Exception:
                 traceback.print_exc()
@@ -859,6 +892,208 @@ def build_pdf_from_grouped_images(
 
     c.save()
     return out_pdf
+
+# ─────────── Word (.docx) con el mismo contenido del PDF ───────────
+def _rgb(hex_color: str) -> RGBColor:
+    return RGBColor.from_string(hex_color.lstrip("#").upper())
+
+def _run(p, text: Any, size: float = 10, bold: bool = False, color: str = "#111111", italic: bool = False):
+    r = p.add_run(str(text))
+    r.font.size = Pt(size); r.bold = bold; r.italic = italic
+    r.font.color.rgb = _rgb(color)
+    return r
+
+def _parrafo(contenedor, align=None, antes: float = 0, despues: float = 0, nueva_pagina: bool = False):
+    p = contenedor.add_paragraph()
+    pf = p.paragraph_format
+    pf.space_before = Pt(antes); pf.space_after = Pt(despues)
+    pf.page_break_before = nueva_pagina
+    if align is not None:
+        p.alignment = align
+    return p
+
+def _bordes(cell, **lados: Tuple[int, str]) -> None:
+    """_bordes(cell, left=(36, '#7AB573')): grosor en octavos de punto. Llamar antes de _sombrear."""
+    tcPr = cell._tc.get_or_add_tcPr()
+    b = tcPr.find(qn("w:tcBorders"))
+    if b is None:
+        b = OxmlElement("w:tcBorders"); tcPr.append(b)
+    for lado in ("top", "left", "bottom", "right"):
+        if lado in lados:
+            sz, color = lados[lado]
+            el = OxmlElement(f"w:{lado}")
+            el.set(qn("w:val"), "single"); el.set(qn("w:sz"), str(sz))
+            el.set(qn("w:space"), "0"); el.set(qn("w:color"), color.lstrip("#"))
+            b.append(el)
+
+def _sombrear(cell, hex_color: str) -> None:
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear"); shd.set(qn("w:color"), "auto"); shd.set(qn("w:fill"), hex_color.lstrip("#"))
+    cell._tc.get_or_add_tcPr().append(shd)
+
+def _tabla(doc, anchos_cm: List[float]):
+    t = doc.add_table(rows=1, cols=len(anchos_cm))
+    t.autofit = False
+    t.alignment = WD_TABLE_ALIGNMENT.CENTER
+    for col, w in zip(t.columns, anchos_cm):
+        col.width = Cm(w)
+    for cell, w in zip(t.rows[0].cells, anchos_cm):
+        cell.width = Cm(w)
+    return t
+
+def _franja_docx(doc, ancho_cm: float, alto_pt: float = 4) -> None:
+    row = _tabla(doc, [ancho_cm / 3] * 3).rows[0]
+    row.height = Pt(alto_pt); row.height_rule = WD_ROW_HEIGHT_RULE.EXACTLY
+    for cell, col in zip(row.cells, (AMS_VERDE, AMS_AMARILLO, AMS_AZUL)):
+        _sombrear(cell, col)
+        cell.paragraphs[0].add_run().font.size = Pt(1)
+
+def _logo_docx(p, ancho_pt: float) -> None:
+    if LOGO_PATH.exists():
+        try:
+            p.add_run().add_picture(str(LOGO_PATH), width=Pt(ancho_pt))
+        except Exception:
+            traceback.print_exc()
+
+def _portada_docx(doc, meta: Dict[str, Any], registros: List[dict]) -> None:
+    d = _datos_portada(meta, registros)
+    gris, claro, linea, rojo = "#8A8C8E", "#F4F5F5", "#D9DADB", "#C0392B"
+    DER, IZQ = WD_ALIGN_PARAGRAPH.RIGHT, WD_ALIGN_PARAGRAPH.LEFT
+
+    # Encabezado: logo a la izquierda, título a la derecha, franja tricolor
+    izq, der = _tabla(doc, [ANCHO_UTIL_CM / 2] * 2).rows[0].cells
+    _logo_docx(izq.paragraphs[0], 150)
+    der.paragraphs[0].alignment = DER
+    _run(der.paragraphs[0], "Rendición de Fondos", 22, True, AMS_GRIS)
+    _run(_parrafo(der, DER, antes=2), "Respaldo de boletas y facturas", 10.5, color=gris)
+    for c in (izq, der):
+        c.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+    _parrafo(doc, despues=8)   # Word une dos tablas seguidas si no hay un párrafo entre ellas
+    _franja_docx(doc, ANCHO_UTIL_CM)
+
+    # Datos de cabecera
+    for i, (lab, val) in enumerate(d["campos"]):
+        _run(_parrafo(doc, antes=18 if i == 0 else 12), lab.upper(), 9, color=gris)
+        destacado = i <= 1      # código del proyecto y campaña
+        _run(_parrafo(doc, antes=2), val, 20 if destacado else 13, True, AMS_GRIS if destacado else "#111111")
+
+    # Tarjetas de resumen (columnas angostas vacías hacen de separación)
+    s = d["saldo"]
+    tarjetas = [("MONTO ASIGNADO", d["asignado"], AMS_GRIS, AMS_AZUL),
+                ("TOTAL GASTADO", d["gastado"], AMS_GRIS, AMS_AMARILLO),
+                ("SALDO", s, rojo if s < 0 else AMS_GRIS, rojo if s < 0 else AMS_AZUL),
+                ("MONTO A DEVOLVER", d["a_devolver"], AMS_GRIS, AMS_VERDE)]
+    _parrafo(doc, despues=16)
+    row = _tabla(doc, [4.2, 0.4, 4.2, 0.4, 4.2, 0.4, 4.2]).rows[0]
+    row.height = Cm(1.9)
+    for i, (lab, val, col, acento) in enumerate(tarjetas):
+        cell = row.cells[i * 2]
+        _bordes(cell, left=(36, acento))
+        _sombrear(cell, claro)
+        cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+        _run(cell.paragraphs[0], lab, 8.5, color=gris)
+        _run(_parrafo(cell, antes=4), _fmt_clp(val), 14, True, col)
+
+    # Tabla por categoría
+    anchos = [5.0, 1.9, 2.8, 2.9, 2.5, 2.9]
+    _parrafo(doc, despues=18)
+    t = _tabla(doc, anchos)
+
+    def _llenar(cells, valores, size, bold=False, color="#111111", fondo=None, rojo_saldo=False, borde_sup=None):
+        for j, (cell, v) in enumerate(zip(cells, valores)):
+            cell.width = Cm(anchos[j])
+            if borde_sup: _bordes(cell, top=borde_sup)
+            if fondo: _sombrear(cell, fondo)
+            cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+            p = cell.paragraphs[0]
+            p.paragraph_format.space_before = Pt(4); p.paragraph_format.space_after = Pt(4)
+            p.alignment = IZQ if j == 0 else DER
+            _run(p, v, size, bold, rojo if (j == 4 and rojo_saldo) else color)
+
+    _llenar(t.rows[0].cells, ("Categoría", "N° boletas", "Monto gastado", "Monto asignado", "Saldo", "Monto a devolver"),
+            9, True, "#FFFFFF", AMS_GRIS)
+    if not d["filas"]:
+        cells = t.add_row().cells
+        m = cells[0].merge(cells[-1])
+        m.paragraphs[0].paragraph_format.space_before = Pt(4)
+        _run(m.paragraphs[0], "Sin registros de gasto", 10, color=gris, italic=True)
+    for i, (cat, nb, monto, asig, sal, dev) in enumerate(d["filas"]):
+        _llenar(t.add_row().cells,
+                (cat, nb, _fmt_clp(monto),
+                 _fmt_clp(asig) if asig is not None else "—",
+                 _fmt_clp(sal) if sal is not None else "—",
+                 _fmt_clp(dev) if dev is not None else "—"),
+                9.5, fondo=claro if i % 2 == 1 else None, rojo_saldo=sal is not None and sal < 0)
+    _llenar(t.add_row().cells,
+            ("Total", len(registros), _fmt_clp(d["gastado"]), _fmt_clp(d["asignado"]),
+             _fmt_clp(s), _fmt_clp(d["a_devolver"])),
+            10, True, AMS_GRIS, rojo_saldo=s < 0, borde_sup=(10, AMS_GRIS))
+
+    # Pie
+    _parrafo(doc, despues=28)
+    izq, der = _tabla(doc, [ANCHO_UTIL_CM / 2] * 2).rows[0].cells
+    for c in (izq, der):
+        _bordes(c, top=(4, linea))
+        c.paragraphs[0].paragraph_format.space_before = Pt(6)
+    _run(izq.paragraphs[0], f"Generado el {d['fechaRend'].strftime('%d-%m-%Y %H:%M')}", 8.5, color=gris)
+    der.paragraphs[0].alignment = DER
+    _run(der.paragraphs[0], f"{len(registros)} registros", 8.5, color=gris)
+
+def _separador_docx(doc, fecha_key: str, n_fotos: int) -> None:
+    """Página que separa las boletas de cada día."""
+    gris = "#8A8C8E"
+    CENTRO = WD_ALIGN_PARAGRAPH.CENTER
+    _logo_docx(_parrafo(doc, nueva_pagina=True), 90)
+    _run(_parrafo(doc, CENTRO, antes=230), "BOLETAS DEL DÍA", 11, color=gris)
+    _run(_parrafo(doc, CENTRO, antes=4, despues=10), fecha_key, 40, True, AMS_GRIS)
+    _franja_docx(doc, 9.2, 5)
+    largo = _fecha_larga(fecha_key)
+    pie = f"{n_fotos} respaldo" + ("" if n_fotos == 1 else "s")
+    _run(_parrafo(doc, CENTRO, antes=14), f"{largo}  ·  {pie}" if largo else pie, 12, color=gris)
+
+def build_docx_from_grouped_images(
+    grouped: Dict[str, List[Path]],
+    out_docx: Union[str, Path],
+    meta: Optional[Dict[str, Any]] = None,
+    registros: Optional[List[dict]] = None,
+) -> Path:
+    out_docx = _unique_path(Path(out_docx))
+    doc = Document()
+    sec = doc.sections[0]
+    sec.page_width, sec.page_height = Cm(21), Cm(29.7)
+    sec.left_margin = sec.right_margin = sec.top_margin = sec.bottom_margin = Cm(MARGEN_DOCX_CM)
+    normal = doc.styles["Normal"]
+    normal.font.name = "Arial"; normal.font.size = Pt(10)
+    normal.paragraph_format.space_before = Pt(0); normal.paragraph_format.space_after = Pt(0)
+
+    if meta is not None:
+        _portada_docx(doc, meta, registros or [])
+
+    if not grouped:
+        _run(_parrafo(doc, WD_ALIGN_PARAGRAPH.CENTER, antes=300, nueva_pagina=meta is not None),
+             "Sin fotos", 18, True)
+        doc.save(str(out_docx))
+        return out_docx
+
+    # Un poco menos que el alto útil para que la foto no empuje un salto de página extra
+    max_w, max_h = Cm(ANCHO_UTIL_CM), Cm(ALTO_UTIL_CM - 1)
+    for fecha_key, paths in grouped.items():
+        _separador_docx(doc, fecha_key, len(paths))
+        for p in paths:
+            try:
+                im = _abrir_boleta(p)
+                im.thumbnail((2400, 2400))      # limita el peso del .docx
+                w, h = im.size
+                scale = min(max_w / w, max_h / h)
+                buf = BytesIO(); im.save(buf, format="JPEG", quality=88); buf.seek(0)
+                par = _parrafo(doc, WD_ALIGN_PARAGRAPH.CENTER, nueva_pagina=True)
+                par.add_run().add_picture(buf, width=Emu(int(w * scale)), height=Emu(int(h * scale)))
+            except Exception:
+                traceback.print_exc()
+                continue
+
+    doc.save(str(out_docx))
+    return out_docx
 
 # ───────────────────────── Lógica de orquestación ──────────────────────────
 def generar_rendicion_bundle(
@@ -868,7 +1103,7 @@ def generar_rendicion_bundle(
     fotos_field: str = "foto",
     start_row: int = 11,
     sheet_name: Optional[str] = None,
-) -> Tuple[Path, Path]:
+) -> Tuple[Path, Path, Path]:
     template = Path(template_path or TEMPLATE_XLSX_DEFAULT)
     fotos_dir = default_fotos_dir()
 
@@ -905,7 +1140,10 @@ def generar_rendicion_bundle(
         pdf_name = "Rendicion_Fotos.pdf"
 
     pdf_out = build_pdf_from_grouped_images(grouped, OUTPUT_DIR / pdf_name, meta=meta, registros=registros)
-    return excel_out, pdf_out
+    word_out = build_docx_from_grouped_images(
+        grouped, OUTPUT_DIR / (Path(pdf_name).stem + ".docx"), meta=meta, registros=registros
+    )
+    return excel_out, pdf_out, word_out
 
 # ───────────────────────────────── Endpoints ────────────────────────────────
 @app.get("/health")
@@ -915,7 +1153,7 @@ def health():
 @app.get("/rendicion")
 def rendicion(request: Request, campana_id: str):
     try:
-        excel_out, pdf_out = generar_rendicion_bundle(
+        excel_out, pdf_out, word_out = generar_rendicion_bundle(
             campana_id=campana_id,
             template_path=None,
             collection_name="registros",
@@ -931,11 +1169,18 @@ def rendicion(request: Request, campana_id: str):
 
     excel_url = str(request.url_for("download_file", kind="excel", filename=excel_out.name))
     pdf_url   = str(request.url_for("download_file", kind="pdf",   filename=pdf_out.name))
-    return JSONResponse({"excel_url": excel_url, "pdf_url": pdf_url})
+    word_url  = str(request.url_for("download_file", kind="word",  filename=word_out.name))
+    return JSONResponse({"excel_url": excel_url, "pdf_url": pdf_url, "word_url": word_url})
+
+MEDIA_TYPES = {
+    "excel": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "pdf":   "application/pdf",
+    "word":  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
 
 @app.get("/download/{kind}/{filename}")
 def download_file(kind: str, filename: str):
-    if kind not in {"excel", "pdf"}:
+    if kind not in MEDIA_TYPES:
         raise HTTPException(status_code=400, detail="kind inválido")
 
     base_dir = OUTPUT_DIR
@@ -949,7 +1194,6 @@ def download_file(kind: str, filename: str):
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Archivo no encontrado")
 
-    media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if kind=="excel" else "application/pdf"
-    return FileResponse(path=str(file_path), media_type=media, filename=file_path.name)
+    return FileResponse(path=str(file_path), media_type=MEDIA_TYPES[kind], filename=file_path.name)
 
 # (en Render: START ➜ uvicorn app:app --host 0.0.0.0 --port $PORT)
