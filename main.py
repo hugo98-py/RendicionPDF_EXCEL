@@ -86,6 +86,12 @@ MESES_ES = [
     "julio","agosto","septiembre","octubre","noviembre","diciembre"
 ]
 
+# Meses abreviados para el nombre de los archivos ("15 al 17 jul 26")
+MESES_CORTOS_ES = [
+    "ene","feb","mar","abr","may","jun",
+    "jul","ago","sep","oct","nov","dic"
+]
+
 # ─────────────────────────────── FastAPI init ───────────────────────────────
 app = FastAPI(title="Rendidor API", version="1.1.0")
 
@@ -210,6 +216,34 @@ def _clean_monto(x: Any) -> float:
 
 def mes_es(dt: datetime) -> str:
     return MESES_ES[dt.month - 1]
+
+def _a_chile(dt: Optional[datetime]) -> Optional[datetime]:
+    """Fechas de Firestore vienen en UTC: se pasan a hora de Chile para no correr el día."""
+    if dt is None:
+        return None
+    return dt.astimezone(TZ_CHILE) if dt.tzinfo else dt
+
+def nombre_base_archivos(codigo: Any, inicio: Optional[datetime], fin: Optional[datetime]) -> str:
+    """'AES014' + 15/07/2026 + 17/07/2026 -> 'AES014 15 al 17 jul 26'.
+    Otros casos: '31 jul al 4 ago 26', '28 dic 25 al 3 ene 26', '15 jul 26' (un solo día).
+    Sin fechas: solo el código."""
+    # Caracteres no permitidos en nombres de archivo -> '-'
+    codigo = re.sub(r'[\\/:*?"<>|]+', "-", str(codigo or "").strip()) or "Rendicion"
+    if inicio is None:
+        return codigo
+    fin = fin or inicio
+    mes = lambda d: MESES_CORTOS_ES[d.month - 1]
+    anio = lambda d: d.strftime("%y")
+
+    if inicio.date() == fin.date():
+        periodo = f"{inicio.day} {mes(inicio)} {anio(inicio)}"
+    elif (inicio.year, inicio.month) == (fin.year, fin.month):
+        periodo = f"{inicio.day} al {fin.day} {mes(fin)} {anio(fin)}"
+    elif inicio.year == fin.year:
+        periodo = f"{inicio.day} {mes(inicio)} al {fin.day} {mes(fin)} {anio(fin)}"
+    else:
+        periodo = f"{inicio.day} {mes(inicio)} {anio(inicio)} al {fin.day} {mes(fin)} {anio(fin)}"
+    return f"{codigo} {periodo}"
 
 def _fmt_clp(x: Any) -> str:
     v = int(round(_clean_monto(x)))
@@ -564,15 +598,11 @@ def write_excel_from_template(
     try: ws[g16_cell].number_format = ws[g14_cell].number_format
     except Exception: pass
 
-    # Nombre de salida
-    if startDC:
-        startDay = str(int(startDC.strftime("%d"))); startMonth = startDC.strftime("%m"); startYear = startDC.strftime("%Y")
-    else:
-        startDay, startMonth, startYear = "01","01","1900"
-    endDay = str(int(endDC.strftime("%d"))) if endDC else startDay
-
-    out_name = f"{nameCampana} Rendición {startDay}-{endDay} {startMonth} {startYear}.xlsx"
-    out_path = _unique_path(OUTPUT_DIR / out_name)
+    # Nombre de salida: "AES014 15 al 17 jul 26 Rendición.xlsx"
+    base = meta.get("nombreArchivo") or nombre_base_archivos(
+        meta.get("codProy") or nameCampana, startDC, endDC
+    )
+    out_path = _unique_path(OUTPUT_DIR / f"{base} Rendición.xlsx")
     try:
         wb.save(out_path)
     except PermissionError:
@@ -1135,24 +1165,25 @@ def generar_rendicion_bundle(
     if camp.get("montoTotal") is not None:
         meta["montoTotal"] = _clean_monto(camp.get("montoTotal"))
 
+    # Nombre base de los archivos: "AES014 15 al 17 jul 26".
+    # Fechas de la campaña (startDate / EndDate); si faltan, las de los registros.
+    inicio = _a_chile(_parse_us_dt(camp.get("startDate"))) or meta.get("startDateCampana")
+    fin = (_a_chile(_parse_us_dt(camp.get("EndDate") or camp.get("endDate")))
+           or meta.get("endDateCampana") or inicio)
+    meta["nombreArchivo"] = nombre_base_archivos(meta["codProy"], inicio, fin)
+
     excel_out = write_excel_from_template(template, registros, meta, start_row=start_row, sheet_name=sheet_name)
     _, gcs_client = init_clients()
     grouped = download_images_grouped_by_date(registros, gcs_client, out_dir=fotos_dir, max_workers=8)
     grouped = preparar_boletas(grouped)
 
-    startDC = meta.get("startDateCampana")
-    endDC = meta.get("endDateCampana") or startDC
-    if startDC:
-        startDay = str(int(startDC.strftime("%d")))
-        endDay = str(int((endDC or startDC).strftime("%d")))
-        mes = mes_es(startDC); yy = startDC.strftime("%y")
-        pdf_name = f"{meta.get('nameCampana', '—')} Rendición {startDay}-{endDay} {mes} {yy}.pdf"
-    else:
-        pdf_name = "Rendicion_Fotos.pdf"
-
-    pdf_out = build_pdf_from_grouped_images(grouped, OUTPUT_DIR / pdf_name, meta=meta, registros=registros)
+    # PDF y Word: "AES014 15 al 17 jul 26 Comprobantes"
+    nombre_comprobantes = f"{meta['nombreArchivo']} Comprobantes"
+    pdf_out = build_pdf_from_grouped_images(
+        grouped, OUTPUT_DIR / f"{nombre_comprobantes}.pdf", meta=meta, registros=registros
+    )
     word_out = build_docx_from_grouped_images(
-        grouped, OUTPUT_DIR / (Path(pdf_name).stem + ".docx"), meta=meta, registros=registros
+        grouped, OUTPUT_DIR / f"{nombre_comprobantes}.docx", meta=meta, registros=registros
     )
     return excel_out, pdf_out, word_out
 
