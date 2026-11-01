@@ -367,7 +367,7 @@ def _find_headers(ws: Worksheet, names=("Fecha","Detalle","Boleta","Gasto"), sea
                 if v in wanted and v not in headers:
                     headers[v] = c
         if len(headers) == len(names): break
-    defaults = {"Fecha":1, "Detalle":4, "Factura":5, "Boleta":6, "Gasto":7}
+    defaults = {"Fecha":1, "Concepto 1":2, "Concepto 2":3, "Detalle":4, "Factura":5, "Boleta":6, "Gasto":7}
     for k in defaults: headers.setdefault(k, defaults[k])
     return headers
 
@@ -504,7 +504,10 @@ def write_excel_from_template(
     wb = load_workbook(template_path, data_only=False)
     ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb.active
 
-    cols = _find_headers(ws, names=("Fecha", "Detalle", "Factura", "Boleta", "Gasto"))
+    cols = _find_headers(ws, names=("Fecha", "Concepto 1", "Concepto 2", "Detalle", "Factura", "Boleta", "Gasto"))
+
+    # Valores fijos de Concepto 1 / Concepto 2: los que trae la plantilla en la primera fila de datos
+    conceptos = {k: ws.cell(row=start_row, column=cols[k]).value for k in ("Concepto 1", "Concepto 2")}
 
     nameCampana = meta.get("nameCampana") or DEFAULT_NAME_CAMPANA
     namePersona = meta.get("namePersona") or DEFAULT_NAME_PERSONA
@@ -515,13 +518,14 @@ def write_excel_from_template(
     fechaRend: datetime = meta.get("fechaRendicion") or datetime.now(TZ_CHILE)
 
     ws["C4"] = meta.get("codProy") or nameCampana
-    ws["C5"] = meta.get("responsable") or namePersona
+    ws["C5"] = meta.get("responsableName") or meta.get("responsable") or namePersona
     ws["C6"] = _to_ddmmyyyy(fechaRend)
     if startDC: ws["E4"] = _to_ddmmyyyy(startDC)
     if endDC:   ws["E5"] = _to_ddmmyyyy(endDC)
     ws["E7"] = _clean_monto(montoTotal)
 
-    used_cols = [cols["Fecha"], cols["Detalle"], cols["Factura"], cols["Boleta"], cols["Gasto"]]
+    used_cols = [cols["Fecha"], cols["Concepto 1"], cols["Concepto 2"], cols["Detalle"],
+                 cols["Factura"], cols["Boleta"], cols["Gasto"]]
     n = len(registros)
 
     if n >= 2:
@@ -542,6 +546,8 @@ def write_excel_from_template(
         row = start_row + idx
         dt = reg["date"]
         ws.cell(row=row, column=cols["Fecha"]).value = _to_ddmmyyyy(dt) if dt else ""
+        for k, v in conceptos.items():
+            ws.cell(row=row, column=cols[k]).value = v
         ws.cell(row=row, column=cols["Detalle"]).value = reg.get("categoria", "")
         # El N° de documento va en "Factura" (E) o en "Boleta" (F) según el tipo de comprobante
         col_doc = cols["Factura"] if reg.get("esFactura") else cols["Boleta"]
@@ -562,6 +568,10 @@ def write_excel_from_template(
     gasto_col_idx    = cols["Gasto"]
     gasto_col_letter = get_column_letter(gasto_col_idx)
     sum_cell = f"G{sum_row}"
+
+    # El autofiltro de la plantilla (A10:G12) no se desplaza con insert_rows: se extiende a mano
+    if ws.auto_filter.ref:
+        ws.auto_filter.ref = f"A{start_row - 1}:G{sum_row}"
 
     try: prev_fmt = ws[sum_cell].number_format
     except Exception: prev_fmt = None
@@ -723,17 +733,22 @@ def _datos_portada(meta: Dict[str, Any], registros: List[dict]) -> Dict[str, Any
     """Datos de la portada (cabecera, tarjetas y tabla por categoría), comunes al PDF y al Word."""
     startDC, endDC = meta.get("startDateCampana"), meta.get("endDateCampana")
     fechaRend = meta.get("fechaRendicion") or datetime.now(TZ_CHILE)
+    # Responsable: nombre y, debajo, el correo (solo el correo si no hay nombre)
+    resp_nombre = str(meta.get("responsableName") or "").strip()
+    resp_correo = str(meta.get("responsable") or "").strip()
+    # (etiqueta, valor, línea secundaria bajo el valor)
     campos = [
-        ("Código del proyecto",      meta.get("codProy") or "—"),
-        ("Campaña",                  meta.get("nameCampana") or "—"),
-        ("Responsable de rendición", meta.get("responsable") or "—"),
-        ("Fecha de rendición",       _to_ddmmyyyy(fechaRend)),
+        ("Código del proyecto",      meta.get("codProy") or "—", ""),
+        ("Campaña",                  meta.get("nameCampana") or "—", ""),
+        ("Responsable de rendición", resp_nombre or resp_correo or "—",
+         resp_correo if resp_nombre and resp_correo != resp_nombre else ""),
+        ("Fecha de rendición",       _to_ddmmyyyy(fechaRend), ""),
     ]
     periodo = str(meta.get("periodoTexto") or "").strip()
     if not periodo and startDC:
         periodo = f"{_to_ddmmyyyy(startDC)} al {_to_ddmmyyyy(endDC or startDC)}"
     if periodo:
-        campos.append(("Período de terreno", periodo))
+        campos.append(("Período de terreno", periodo, ""))
 
     # ── Datos de la tabla ──
     resumen = resumen_por_categoria(registros)
@@ -808,7 +823,7 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
 
     # Datos de cabecera
     y = ph - 170
-    for i, (lab, val) in enumerate(campos):
+    for i, (lab, val, sub) in enumerate(campos):
         c.setFillColor(gris); c.setFont("Helvetica", 9)
         c.drawString(mx, y, lab.upper())
         destacado = i <= 1      # código del proyecto y campaña
@@ -817,6 +832,10 @@ def draw_portada(c, meta: Dict[str, Any], registros: List[dict]) -> None:
         c.setFont("Helvetica-Bold", fsz)
         c.drawString(mx, y - fsz - 2, _fit_text(c, val, "Helvetica-Bold", fsz, pw - 2 * mx))
         y -= fsz + 28
+        if sub:     # línea secundaria (correo del responsable) bajo el valor
+            c.setFillColor(gris); c.setFont("Helvetica", 10)
+            c.drawString(mx, y + 12, _fit_text(c, sub, "Helvetica", 10, pw - 2 * mx))
+            y -= 14
 
     # Tarjetas de resumen
     tarjetas = [("MONTO ASIGNADO", asignado, azul, celeste), ("TOTAL GASTADO", gastado, azul, amarillo),
@@ -1014,10 +1033,12 @@ def _portada_docx(doc, meta: Dict[str, Any], registros: List[dict]) -> None:
     _franja_docx(doc, ANCHO_UTIL_CM)
 
     # Datos de cabecera
-    for i, (lab, val) in enumerate(d["campos"]):
+    for i, (lab, val, sub) in enumerate(d["campos"]):
         _run(_parrafo(doc, antes=18 if i == 0 else 12), lab.upper(), 9, color=gris)
         destacado = i <= 1      # código del proyecto y campaña
         _run(_parrafo(doc, antes=2), val, 20 if destacado else 13, True, AMS_GRIS if destacado else "#111111")
+        if sub:     # línea secundaria (correo del responsable) bajo el valor
+            _run(_parrafo(doc, antes=1), sub, 10, color=gris)
 
     # Tarjetas de resumen (columnas angostas vacías hacen de separación)
     s = d["saldo"]
@@ -1158,6 +1179,7 @@ def generar_rendicion_bundle(
     meta["codProy"]        = camp.get("codProy") or meta["nameCampana"]
     meta["nameCampana"]    = camp.get("name") or meta["nameCampana"]
     meta["responsable"]    = camp.get("responsable") or meta["namePersona"]
+    meta["responsableName"] = str(camp.get("responsableName") or "").strip()
     meta["fechaRendicion"] = datetime.now(TZ_CHILE)
     meta["periodoTexto"]   = camp.get("dateTimeTextFormat") or ""
     meta["montosCategoria"] = montos_por_categoria(camp)
