@@ -325,7 +325,7 @@ def fetch_registros(
 
     for doc in q.stream():
         data = doc.to_dict() or {}
-        d_dt = _parse_us_dt(data.get("date")) or _parse_us_dt(data.get("Fecha"))
+        d_dt = _a_chile(_parse_us_dt(data.get("date")) or _parse_us_dt(data.get("Fecha")))
         cat = data.get("categoria") or data.get("Detalle") or ""
         idb = data.get("idBoleta") or data.get("Boleta") or ""
         mon = _clean_monto(data.get("monto") or data.get("Gasto"))
@@ -338,8 +338,8 @@ def fetch_registros(
         })
         if nameCampana is None: nameCampana = data.get("nameCampana")
         if namePersona is None: namePersona = data.get("namePersona")
-        if startDC is None:    startDC = _parse_us_dt(data.get("startDateCampana"))
-        if endDC   is None:    endDC   = _parse_us_dt(data.get("endDateCampana"))
+        if startDC is None:    startDC = _a_chile(_parse_us_dt(data.get("startDateCampana")))
+        if endDC   is None:    endDC   = _a_chile(_parse_us_dt(data.get("endDateCampana")))
         if not montoTotal:     montoTotal = _clean_monto(data.get("montoTotal"))
 
     fechas_validas = [r["date"] for r in registros if r["date"] is not None]
@@ -353,7 +353,8 @@ def fetch_registros(
         "endDateCampana": endDC,
         "montoTotal": montoTotal,
     }
-    registros.sort(key=lambda r: (r["date"] or datetime(1900,1,1), r["doc_id"]))
+    # Sin fecha quedan primero (como antes); .timestamp() evita mezclar datetimes con y sin zona.
+    registros.sort(key=lambda r: (r["date"].timestamp() if r["date"] else float("-inf"), r["doc_id"]))
     return registros, meta
 
 # ─────── Excel: headers / estilo / escritura desde plantilla ───────
